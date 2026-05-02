@@ -5,7 +5,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from base_strategy import BaseExecutionStrategy
+from base_strategy import BaseStrategy
 
 PARAMS: dict = {
     "search_end_sec": 50,
@@ -139,7 +139,7 @@ def _parse_sec(w: str) -> float:
     return float(w)
 
 
-class YeStrategy(BaseExecutionStrategy):
+class Strategy(BaseStrategy):
     def __init__(self, side: str) -> None:
         super().__init__(side)
 

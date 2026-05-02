@@ -3,7 +3,7 @@ import os
 import pandas as pd
 from scipy import stats
 
-from ye_strategy import YeStrategy
+from zijie_strategy import Strategy
 
 
 def run_backtest(df, strategy_class, *args, **kwargs):
@@ -56,11 +56,11 @@ def run_backtest(df, strategy_class, *args, **kwargs):
 
 
 if __name__ == "__main__":
-    tickers = {"AMZN", "GOOG", "INTC", "MSFT"}
+    tickers = ["AMZN", "GOOG", "INTC", "MSFT"]
 
     summary_data = []
     for ticker in tickers:
-        file_path = f"{ticker}_5levels_train.csv"
+        file_path = f"data/{ticker}_5levels_train.csv"
 
         if not os.path.exists(file_path):
             print(f"File '{file_path}' doesn't exist.")
@@ -78,9 +78,9 @@ if __name__ == "__main__":
         df.set_index("Time_dt", inplace=True)
         df["Minute"] = df.index.floor("min")
 
-        result_df = run_backtest(df, YeStrategy)
+        result_df = run_backtest(df, Strategy)
 
-        output_name = f"{ticker}_backtest_result.csv"
+        output_name = f"results/{ticker}_backtest_result.csv"
         result_df.to_csv(output_name, index=False)
 
         print(f"Backtested {ticker}. Results saved to {output_name}.")
@@ -108,5 +108,5 @@ if __name__ == "__main__":
 
     if summary_data:
         summary_df = pd.DataFrame(summary_data)
-        summary_df.to_csv("summary_stats.csv", index=False)
-        print("\nAll backtests completed. Summary saved to summary_stats.csv")
+        summary_df.to_csv("results/summary_stats.csv", index=False)
+        print("\nAll backtests completed. Summary saved to results/summary_stats.csv")

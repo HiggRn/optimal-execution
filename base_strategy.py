@@ -1,4 +1,4 @@
-class BaseExecutionStrategy:
+class BaseStrategy:
     def __init__(self, side):
         self.side = side
 
