@@ -114,27 +114,35 @@ class Strategy(BaseStrategy):
                 time_fraction_left = max(0.0, (55.0 - sec) / 53.0)
 
                 local_spread_mean = sum(self._spread_buf) / len(self._spread_buf)
-                expected_profit_usd = 1.5 * local_spread_mean * time_fraction_left
+
+                curr_p = ask1 if self.side == "BUY" else bid1
+                profit_usd = (
+                    (self._arrival_price - curr_p)
+                    if self.side == "BUY"
+                    else (curr_p - self._arrival_price)
+                )
 
                 if self.side == "BUY":
+                    expected_profit_usd = 1.5 * local_spread_mean * time_fraction_left
                     reversion_buy = (
                         (obi_z > 0.5) and (net_flow <= 0) and (micro_edge > 0)
                     )
+
                     panic_buy = obi_z > 1.5
 
                     if profit_usd >= expected_profit_usd and reversion_buy:
                         fire = True
-                    elif profit_usd <= 0 and panic_buy:
+                    elif profit_usd < 0 and panic_buy:
                         fire = True
                 else:  # SELL
-                    reversion_sell = (
-                        (obi_z < -0.5) and (net_flow >= 0) and (micro_edge < 0)
-                    )
-                    panic_sell = obi_z < -1.5
+                    expected_profit_usd = 0.8 * local_spread_mean * time_fraction_left
+                    reversion_sell = (obi_z < 0.0) and (micro_edge < 0)
+
+                    panic_sell = obi_z < -0.5
 
                     if profit_usd >= expected_profit_usd and reversion_sell:
                         fire = True
-                    elif profit_usd <= 0 and panic_sell:
+                    elif profit_usd < 0 and panic_sell:
                         fire = True
 
         if fire:
