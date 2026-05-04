@@ -7,6 +7,29 @@ import pandas as pd
 from base_strategy import BaseStrategy
 
 
+class TimeRollingSum:
+    __slots__ = ("_window_sec", "_buf", "_total")
+
+    def __init__(self, window_sec: float) -> None:
+        self._window_sec = window_sec
+        self._buf: deque[tuple[pd.Timestamp, float]] = deque()
+        self._total: float = 0.0
+
+    def _evict(self, current_time: pd.Timestamp) -> None:
+        cutoff = current_time - pd.Timedelta(seconds=self._window_sec)
+        while self._buf and self._buf[0][0] < cutoff:
+            _, v = self._buf.popleft()
+            self._total -= v
+
+    def read(self, current_time: pd.Timestamp) -> float:
+        self._evict(current_time)
+        return self._total
+
+    def push(self, current_time: pd.Timestamp, val: float) -> None:
+        self._buf.append((current_time, val))
+        self._total += val
+
+
 class Strategy(BaseStrategy):
     def __init__(self, side: str) -> None:
         super().__init__(side)
@@ -14,8 +37,12 @@ class Strategy(BaseStrategy):
         self._executed: bool = False
         self._arrival_price: Optional[float] = None
 
-        # 仅维护一个用于计算局部 Z-score 的滚动窗口
         self._obi_buf = deque(maxlen=100)
+
+        self._buy_flow = TimeRollingSum(3.0)
+        self._sell_flow = TimeRollingSum(3.0)
+
+        self._tick_size = 0.01
 
     def _reset_minute(self):
         self._executed = False
@@ -36,10 +63,23 @@ class Strategy(BaseStrategy):
         if self._arrival_price is None:
             self._arrival_price = ask1 if self.side == "BUY" else bid1
 
+        vis_exec = float(current_row.get("VisibleExecution_1=Yes_0=No", 0) or 0)
+        hid_exec = float(current_row.get("HiddenExecution_1=Yes_0=No", 0) or 0)
+        direction = float(current_row.get("Direction_1=Buy_-1=Sell", 0) or 0)
+        size = float(current_row.get("Size", 0) or 0)
+
+        is_exec = (vis_exec == 1.0) or (hid_exec == 1.0)
+        exec_vol = size if is_exec else 0.0
+
+        b_vol_tick = exec_vol if direction == 1.0 else 0.0
+        s_vol_tick = exec_vol if direction == -1.0 else 0.0
+
+        self._buy_flow.push(current_time, b_vol_tick)
+        self._sell_flow.push(current_time, s_vol_tick)
+
         bid_v = sum(float(current_row.get(f"BidSize_{i}", 0) or 0) for i in range(1, 6))
         ask_v = sum(float(current_row.get(f"AskSize_{i}", 0) or 0) for i in range(1, 6))
         obi = (bid_v - ask_v) / (bid_v + ask_v + 1e-9)
-
         self._obi_buf.append(obi)
 
         fire = False
@@ -54,22 +94,36 @@ class Strategy(BaseStrategy):
                 obi_std = math.sqrt(variance) + 1e-9
                 obi_z = (obi - obi_mean) / obi_std
 
+                recent_buy_flow = self._buy_flow.read(current_time)
+                recent_sell_flow = self._sell_flow.read(current_time)
+                net_flow = recent_buy_flow - recent_sell_flow
+
                 curr_p = ask1 if self.side == "BUY" else bid1
-                profit = (
+                profit_usd = (
                     (self._arrival_price - curr_p)
                     if self.side == "BUY"
                     else (curr_p - self._arrival_price)
                 )
+                profit_ticks = profit_usd / self._tick_size
+
+                time_fraction_left = max(0.0, (55.0 - sec) / 53.0)
+                expected_profit_ticks = 2.0 * time_fraction_left
 
                 if self.side == "BUY":
-                    if profit > 0 and obi_z > 0.5:
+                    reversion_buy = (obi_z > 0.5) and (net_flow <= 0)
+                    panic_buy = obi_z > 1.5
+
+                    if profit_ticks >= expected_profit_ticks and reversion_buy:
                         fire = True
-                    elif profit <= 0 and obi_z > 1.5:
+                    elif profit_ticks <= 0 and panic_buy:
                         fire = True
                 else:  # SELL
-                    if profit > 0 and obi_z < -0.5:
+                    reversion_sell = (obi_z < -0.5) and (net_flow >= 0)
+                    panic_sell = obi_z < -1.5
+
+                    if profit_ticks >= expected_profit_ticks and reversion_sell:
                         fire = True
-                    elif profit <= 0 and obi_z < -1.5:
+                    elif profit_ticks <= 0 and panic_sell:
                         fire = True
 
         if fire:
