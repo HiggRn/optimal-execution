@@ -19,19 +19,24 @@ def run_backtest(df, strategy_class, *args, **kwargs):
             )
 
             exec_price = None
+            exec_time = None
 
+            executed = False
             for idx, row in grp.iterrows():
                 if strat.on_tick(row, idx):
-                    exec_price = (
-                        row["AskPrice_1"] if side == "BUY" else row["BidPrice_1"]
-                    )
-                    break
+                    if not executed:
+                        exec_price = (
+                            row["AskPrice_1"] if side == "BUY" else row["BidPrice_1"]
+                        )
+                        exec_time = idx
+                        executed = True
 
             if exec_price is None:
                 last_row = grp.iloc[-1]
                 exec_price = (
                     last_row["AskPrice_1"] if side == "BUY" else last_row["BidPrice_1"]
                 )
+                exec_time = grp.index[-1]
 
             improvement = (
                 twap_price - exec_price if side == "BUY" else exec_price - twap_price
@@ -48,7 +53,11 @@ def run_backtest(df, strategy_class, *args, **kwargs):
                     "TWAP_Price": twap_price,
                     "Exec_Price": exec_price,
                     "Optm_Price": optm_price,
-                    "Improvement_bps": (improvement / twap_price) * 10000,
+                    "Improvement_bps": improvement / twap_price * 10000,
+                    "Optm_Improvement_bps": abs(optm_price - twap_price)
+                    / twap_price
+                    * 10000,
+                    "Exec_Time": exec_time,
                 }
             )
 
