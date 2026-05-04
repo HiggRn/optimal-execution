@@ -7,18 +7,20 @@ import pandas as pd
 
 from base_strategy import BaseStrategy
 
-# Global parameters
+# Global parameters modified for Classification / Ranking Scheme
 PARAMS: dict = {
     "force_exec_sec": 55.0,
-    "min_wait_sec": 2.0,
-    "predict_horizon_sec": 2.0,
-    "urgency_spread_mult": 0.5,
-    "rls_lambda": 0.9995,
-    "rls_p_init": 10.0,
+    "min_wait_sec": 3.0,
     "roll_win": 500,
     "roll_min_periods": 30,
     "short": "1s",
     "mid": "5s",
+    # ML Parameters
+    "top_k_pct": 15,
+    "learning_rate": 0.01,
+    "l2_reg": 0.001,
+    "sgd_epochs": 2,
+    "consecutive_bins": 2,
 }
 
 FEATURE_KEYS = [
@@ -129,37 +131,70 @@ class Strategy(BaseStrategy):
         }
 
         self.w = np.zeros(N_FEAT)
-        self.P = PARAMS["rls_p_init"] * np.eye(N_FEAT)
+        self.b = 0.0
 
-        self.rls_queue = deque()
+        self._minute_data = []
+        self._score_buf = deque(maxlen=rw)
+        self._consecutive_hits = 0
 
         self._current_minute: Optional[pd.Timestamp] = None
         self._executed: bool = False
         self._prev_bid1: Optional[float] = None
         self._prev_ask1: Optional[float] = None
 
-    def _rls_update(self, z: np.ndarray, y: float):
-        Pz = self.P @ z
-        k = Pz / (PARAMS["rls_lambda"] + z @ Pz)
-        self.w += k * (y - self.w @ z)
-        self.P = (self.P - np.outer(k, Pz)) / PARAMS["rls_lambda"]
+    def _train_model(self):
+        if len(self._minute_data) < 20:
+            return
+
+        prices = np.array([data[1] for data in self._minute_data])
+
+        k_pct = PARAMS["top_k_pct"]
+        if self.side == "BUY":
+            threshold = np.percentile(prices, k_pct)
+            labels = (prices <= threshold).astype(int)
+        else:
+            threshold = np.percentile(prices, 100 - k_pct)
+            labels = (prices >= threshold).astype(int)
+
+        w_1 = 1.0 / (k_pct / 100.0)
+        w_0 = 1.0 / (1.0 - k_pct / 100.0)
+
+        lr = PARAMS["learning_rate"]
+        l2 = PARAMS["l2_reg"]
+
+        for _ in range(PARAMS["sgd_epochs"]):
+            indices = np.random.permutation(len(self._minute_data))
+            for i in indices:
+                z, _ = self._minute_data[i]
+                y = labels[i]
+
+                logit = np.dot(self.w, z) + self.b
+                logit = max(min(logit, 20), -20)
+                y_hat = 1.0 / (1.0 + math.exp(-logit))
+
+                error = y_hat - y
+                weight = w_1 if y == 1 else w_0
+                grad = weight * error
+
+                self.w -= lr * (grad * z + l2 * self.w)
+                self.b -= lr * grad
 
     def _reset_minute(self):
+        if self._minute_data:
+            self._train_model()
+
+        self._minute_data.clear()
+        self._consecutive_hits = 0
         self._executed = False
 
     def on_tick(self, current_row: pd.Series, current_time: pd.Timestamp) -> bool:
-        # 0. minute reset
         minute = current_time.floor("min")
         if minute != self._current_minute:
             self._current_minute = minute
             self._reset_minute()
 
-        if self._executed:
-            return False
-
         sec = current_time.second + current_time.microsecond / 1e6
 
-        # 1. Extract data
         bid1 = float(current_row["BidPrice_1"])
         ask1 = float(current_row["AskPrice_1"])
         bsz1 = float(current_row["BidSize_1"])
@@ -198,13 +233,14 @@ class Strategy(BaseStrategy):
             cancel_flow = size if (cancel_flag and direction == -1) else 0.0
             price_lvl = ask1
             depth = asz1
+            exec_price = ask1
         else:
             exec_flow = total_exec if direction == -1 else 0.0
             cancel_flow = size if (cancel_flag and direction == 1) else 0.0
             price_lvl = bid1
             depth = bsz1
+            exec_price = bid1
 
-        # 2. Read current features
         exec_sum = self._ts_exec.read(current_time)
         cancel_sum = self._ts_cancel.read(current_time)
         quote_inst_sum = self._ts_quote_inst.read(current_time)
@@ -220,7 +256,6 @@ class Strategy(BaseStrategy):
             "depth_z": depth,
         }
 
-        # 3. Z-score normalization
         z_list = []
         all_warm = True
         for k in FEATURE_KEYS:
@@ -231,46 +266,31 @@ class Strategy(BaseStrategy):
 
         z_vec = np.array(z_list)
 
-        # 4. RLS update
-        self.rls_queue.append((current_time, z_vec.copy(), micro))
-        horizon_td = pd.Timedelta(seconds=PARAMS["predict_horizon_sec"])
+        self._minute_data.append((z_vec.copy(), exec_price))
 
-        while self.rls_queue and (current_time - self.rls_queue[0][0]) >= horizon_td:
-            old_time, old_z, old_micro = self.rls_queue.popleft()
+        s_t = float(np.dot(self.w, z_vec) + self.b)
+        self._score_buf.append(s_t)
 
-            time_diff_sec = (current_time - old_time).total_seconds()
-            if time_diff_sec > PARAMS["predict_horizon_sec"] + 1.0:
-                continue
-
-            if self.side == "BUY":
-                y = old_micro - micro
-            else:
-                y = micro - old_micro
-
-            if abs(y) < 10.0:
-                self._rls_update(old_z, y)
-
-        # 5. Optimal stopping
         fire = False
-
-        if sec < PARAMS["min_wait_sec"]:
-            fire = False
-        elif sec >= PARAMS["force_exec_sec"]:
-            fire = True
-        elif all_warm:
-            # s_t: predicted marginal edge in tau seconds
-            s_t = float(np.dot(self.w, z_vec))
-
-            elapsed_active = sec - PARAMS["min_wait_sec"]
-            total_active = PARAMS["force_exec_sec"] - PARAMS["min_wait_sec"]
-            fraction = min(elapsed_active / total_active, 1.0)
-
-            threshold = spread * PARAMS["urgency_spread_mult"] * (fraction - 1.0)
-
-            if s_t <= threshold:
+        if not self._executed:
+            if sec < PARAMS["min_wait_sec"]:
+                self._consecutive_hits = 0
+            elif sec >= PARAMS["force_exec_sec"]:
                 fire = True
+            elif all_warm and len(self._score_buf) >= PARAMS["roll_min_periods"]:
+                q_85 = np.percentile(self._score_buf, 85)
 
-        # 6. Update current tick to buffer
+                if s_t > q_85:
+                    self._consecutive_hits += 1
+                else:
+                    self._consecutive_hits = 0
+
+                if self._consecutive_hits >= PARAMS["consecutive_bins"]:
+                    fire = True
+
+        if fire:
+            self._executed = True
+
         self._ts_exec.push(current_time, exec_flow)
         self._ts_cancel.push(current_time, cancel_flow)
         self._ts_quote_inst.push(current_time, quote_chg)
@@ -280,8 +300,5 @@ class Strategy(BaseStrategy):
 
         self._prev_bid1 = bid1
         self._prev_ask1 = ask1
-
-        if fire:
-            self._executed = True
 
         return fire
