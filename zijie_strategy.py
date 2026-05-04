@@ -39,6 +39,7 @@ class Strategy(BaseStrategy):
 
         self._obi_buf = deque(maxlen=100)
         self._spread_buf = deque(maxlen=100)
+        self._mid_buf = deque(maxlen=50)
 
         self._buy_flow = TimeRollingSum(3.0)
         self._sell_flow = TimeRollingSum(3.0)
@@ -48,6 +49,7 @@ class Strategy(BaseStrategy):
         self._arrival_price = None
         self._obi_buf.clear()
         self._spread_buf.clear()
+        self._mid_buf.clear()
 
     def on_tick(self, current_row: pd.Series, current_time: pd.Timestamp) -> bool:
         minute = current_time.floor("min")
@@ -66,9 +68,10 @@ class Strategy(BaseStrategy):
             self._arrival_price = ask1 if self.side == "BUY" else bid1
 
         spread = ask1 - bid1
-        self._spread_buf.append(spread)
-
         mid = (ask1 + bid1) * 0.5
+        self._spread_buf.append(spread)
+        self._mid_buf.append(mid)
+
         micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1 + 1e-9)
         micro_edge = micro - mid
 
@@ -100,9 +103,12 @@ class Strategy(BaseStrategy):
                 obi_std = math.sqrt(variance) + 1e-9
                 obi_z = (obi - obi_mean) / obi_std
 
-                recent_buy_flow = self._buy_flow.read(current_time)
-                recent_sell_flow = self._sell_flow.read(current_time)
-                net_flow = recent_buy_flow - recent_sell_flow
+                local_mid_mean = sum(self._mid_buf) / len(self._mid_buf)
+                is_downward_trend = local_mid_mean < self._arrival_price
+
+                is_fav_regime = (self.side == "BUY" and is_downward_trend) or (
+                    self.side == "SELL" and not is_downward_trend
+                )
 
                 curr_p = ask1 if self.side == "BUY" else bid1
                 profit_usd = (
@@ -112,38 +118,28 @@ class Strategy(BaseStrategy):
                 )
 
                 time_fraction_left = max(0.0, (55.0 - sec) / 53.0)
-
                 local_spread_mean = sum(self._spread_buf) / len(self._spread_buf)
 
-                curr_p = ask1 if self.side == "BUY" else bid1
-                profit_usd = (
-                    (self._arrival_price - curr_p)
-                    if self.side == "BUY"
-                    else (curr_p - self._arrival_price)
-                )
-
                 if self.side == "BUY":
+                    fav_obi_z = obi_z
+                    fav_micro_edge = micro_edge
+                else:
+                    fav_obi_z = -obi_z
+                    fav_micro_edge = -micro_edge
+
+                if is_fav_regime:
                     expected_profit_usd = 1.5 * local_spread_mean * time_fraction_left
-                    reversion_buy = (
-                        (obi_z > 0.5) and (net_flow <= 0) and (micro_edge > 0)
-                    )
+                    reversion_signal = (fav_obi_z > 0.5) and (fav_micro_edge > 0)
+                    panic_signal = fav_obi_z > 1.5
+                else:
+                    expected_profit_usd = 0.5 * local_spread_mean * time_fraction_left
+                    reversion_signal = (fav_obi_z < 0.8) and (fav_micro_edge < 0.5)
+                    panic_signal = fav_obi_z < 0.0
 
-                    panic_buy = obi_z > 1.5
-
-                    if profit_usd >= expected_profit_usd and reversion_buy:
-                        fire = True
-                    elif profit_usd < 0 and panic_buy:
-                        fire = True
-                else:  # SELL
-                    expected_profit_usd = 0.8 * local_spread_mean * time_fraction_left
-                    reversion_sell = (obi_z < 0.0) and (micro_edge < 0)
-
-                    panic_sell = obi_z < -0.5
-
-                    if profit_usd >= expected_profit_usd and reversion_sell:
-                        fire = True
-                    elif profit_usd < 0 and panic_sell:
-                        fire = True
+                if profit_usd >= expected_profit_usd and reversion_signal:
+                    fire = True
+                elif profit_usd < 0 and panic_signal:
+                    fire = True
 
         if fire:
             self._executed = True
