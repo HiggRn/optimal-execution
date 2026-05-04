@@ -232,7 +232,6 @@ def run_research(ticker: str):
     df = build_features(df)
 
     horizon_sec = 10.0
-    side = "buy"
     target_col = "smooth_wmid"
 
     df[target_col] = smooth_time(df["wmid"].values, df["Time"], halflife_sec=5.0)
@@ -244,7 +243,8 @@ def run_research(ticker: str):
     multivariate_ols_analysis(df, target_col, horizon_sec)
 
     # Goal 3: Oracle Sensitivity
-    oracle_sensitivity_analysis(df, side)
+    for side in ["buy", "sell"]:
+        oracle_sensitivity_analysis(df, side)
 
 
 if __name__ == "__main__":
