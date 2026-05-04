@@ -38,16 +38,16 @@ class Strategy(BaseStrategy):
         self._arrival_price: Optional[float] = None
 
         self._obi_buf = deque(maxlen=100)
+        self._spread_buf = deque(maxlen=100)
 
         self._buy_flow = TimeRollingSum(3.0)
         self._sell_flow = TimeRollingSum(3.0)
-
-        self._tick_size = 0.01
 
     def _reset_minute(self):
         self._executed = False
         self._arrival_price = None
         self._obi_buf.clear()
+        self._spread_buf.clear()
 
     def on_tick(self, current_row: pd.Series, current_time: pd.Timestamp) -> bool:
         minute = current_time.floor("min")
@@ -59,9 +59,18 @@ class Strategy(BaseStrategy):
 
         bid1 = float(current_row["BidPrice_1"])
         ask1 = float(current_row["AskPrice_1"])
+        bsz1 = float(current_row["BidSize_1"])
+        asz1 = float(current_row["AskSize_1"])
 
         if self._arrival_price is None:
             self._arrival_price = ask1 if self.side == "BUY" else bid1
+
+        spread = ask1 - bid1
+        self._spread_buf.append(spread)
+
+        mid = (ask1 + bid1) * 0.5
+        micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1 + 1e-9)
+        micro_edge = micro - mid
 
         vis_exec = float(current_row.get("VisibleExecution_1=Yes_0=No", 0) or 0)
         hid_exec = float(current_row.get("HiddenExecution_1=Yes_0=No", 0) or 0)
@@ -71,11 +80,8 @@ class Strategy(BaseStrategy):
         is_exec = (vis_exec == 1.0) or (hid_exec == 1.0)
         exec_vol = size if is_exec else 0.0
 
-        b_vol_tick = exec_vol if direction == 1.0 else 0.0
-        s_vol_tick = exec_vol if direction == -1.0 else 0.0
-
-        self._buy_flow.push(current_time, b_vol_tick)
-        self._sell_flow.push(current_time, s_vol_tick)
+        self._buy_flow.push(current_time, exec_vol if direction == 1.0 else 0.0)
+        self._sell_flow.push(current_time, exec_vol if direction == -1.0 else 0.0)
 
         bid_v = sum(float(current_row.get(f"BidSize_{i}", 0) or 0) for i in range(1, 6))
         ask_v = sum(float(current_row.get(f"AskSize_{i}", 0) or 0) for i in range(1, 6))
@@ -104,26 +110,31 @@ class Strategy(BaseStrategy):
                     if self.side == "BUY"
                     else (curr_p - self._arrival_price)
                 )
-                profit_ticks = profit_usd / self._tick_size
 
                 time_fraction_left = max(0.0, (55.0 - sec) / 53.0)
-                expected_profit_ticks = 2.0 * time_fraction_left
+
+                local_spread_mean = sum(self._spread_buf) / len(self._spread_buf)
+                expected_profit_usd = 1.5 * local_spread_mean * time_fraction_left
 
                 if self.side == "BUY":
-                    reversion_buy = (obi_z > 0.5) and (net_flow <= 0)
+                    reversion_buy = (
+                        (obi_z > 0.5) and (net_flow <= 0) and (micro_edge > 0)
+                    )
                     panic_buy = obi_z > 1.5
 
-                    if profit_ticks >= expected_profit_ticks and reversion_buy:
+                    if profit_usd >= expected_profit_usd and reversion_buy:
                         fire = True
-                    elif profit_ticks <= 0 and panic_buy:
+                    elif profit_usd <= 0 and panic_buy:
                         fire = True
                 else:  # SELL
-                    reversion_sell = (obi_z < -0.5) and (net_flow >= 0)
+                    reversion_sell = (
+                        (obi_z < -0.5) and (net_flow >= 0) and (micro_edge < 0)
+                    )
                     panic_sell = obi_z < -1.5
 
-                    if profit_ticks >= expected_profit_ticks and reversion_sell:
+                    if profit_usd >= expected_profit_usd and reversion_sell:
                         fire = True
-                    elif profit_ticks <= 0 and panic_sell:
+                    elif profit_usd <= 0 and panic_sell:
                         fire = True
 
         if fire:
