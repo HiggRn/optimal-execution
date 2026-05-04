@@ -84,7 +84,7 @@ def smooth_time(
 def local_dir(
     smooth_px: np.ndarray, times: pd.Series, horizon_sec: float
 ) -> np.ndarray:
-    t = times.values.astype("int64")
+    t = times.to_numpy(dtype="datetime64[ns]").astype("int64")
     h = int(horizon_sec * 1e9)
     n = len(smooth_px)
     direction = np.full(n, np.nan)
@@ -97,13 +97,12 @@ def local_dir(
 def local_return(
     smooth_px: np.ndarray, times: pd.Series, horizon_sec: float
 ) -> np.ndarray:
-    t = times.values.astype("int64")
+    t = times.to_numpy(dtype="datetime64[ns]").astype("int64")
     h = int(horizon_sec * 1e9)
     n = len(smooth_px)
     ret = np.full(n, np.nan)
     js = np.searchsorted(t, t + h)
     valid = js < n
-    # 预测平滑价格的未来变化量 (基础单位)
     ret[valid] = smooth_px[js[valid]] - smooth_px[valid]
     return ret
 
@@ -115,13 +114,11 @@ def regime_ic_analysis(df: pd.DataFrame, target_col: str, horizon_sec: float):
     direction = local_dir(df[target_col].values, df["Time"], horizon_sec)
     df["_target_dir"] = direction
 
-    # 按照流动性状态 (Spread) 划分 Regime
     try:
         df["spread_regime"] = pd.qcut(
             df["spread_bps"], q=3, labels=["Tight", "Normal", "Wide"]
         )
     except ValueError:
-        # INTC 等极小跳动标的可能只有一个点差状态
         df["spread_regime"] = "Normal"
 
     print(f"\n--- Goal 1: Regime-Conditioned IC (Horizon: {horizon_sec}s) ---")
@@ -148,24 +145,20 @@ def regime_ic_analysis(df: pd.DataFrame, target_col: str, horizon_sec: float):
 
 
 def multivariate_ols_analysis(df: pd.DataFrame, target_col: str, horizon_sec: float):
-    # 使用连续的未来收益率作为回归 Target
     future_ret = local_return(df[target_col].values, df["Time"], horizon_sec)
 
     print(f"\n--- Goal 2: Multivariate OLS Regression (Horizon: {horizon_sec}s) ---")
 
-    # 剔除包含成本定义的非方向性特征 (spread)
-    X_cols = ["oib_wgt", "bid_pos", "ask_pos", "bid_slope", "tflow_20"]
+    X_cols = ["oib_wgt", "bid_pos", "bid_slope", "tflow_20"]
 
-    # 准备回归数据
     reg_df = df[X_cols].copy()
     reg_df["Target"] = future_ret
     reg_df = reg_df.dropna()
 
-    if len(reg_df) < 500 or np.var(reg_df["Target"]) < 1e-8:
+    if len(reg_df) < 500 or np.var(reg_df["Target"]) < 1e-12:
         print("Not enough variance for OLS regression.")
         return
 
-    # 对特征进行 Z-score 标准化，使系数具备可比性
     X = reg_df[X_cols]
     X_z = (X - X.mean()) / (X.std() + 1e-9)
     Y = reg_df["Target"]
@@ -173,7 +166,6 @@ def multivariate_ols_analysis(df: pd.DataFrame, target_col: str, horizon_sec: fl
     X_z = sm.add_constant(X_z)
     model = sm.OLS(Y, X_z).fit()
 
-    # 提取并打印关键统计量
     summary = pd.DataFrame(
         {"Coefficient": model.params, "t-stat": model.tvalues, "P>|t|": model.pvalues}
     ).drop("const")
@@ -201,7 +193,6 @@ def oracle_sensitivity_analysis(df: pd.DataFrame, side: str):
     results = []
 
     for hl in halflifes:
-        # 生成不同强度的平滑价格
         smooth_col = f"smooth_{hl}s"
         df[smooth_col] = smooth_time(df[raw_col].values, df["Time"], halflife_sec=hl)
 
@@ -210,7 +201,6 @@ def oracle_sensitivity_analysis(df: pd.DataFrame, side: str):
             if len(grp) < 3:
                 continue
 
-            # Oracle 决策：在当前 halflife 平滑曲线的最优极值点执行 raw price
             idx = (
                 grp[smooth_col].argmin() if side == "buy" else grp[smooth_col].argmax()
             )
@@ -241,19 +231,11 @@ def run_research(ticker: str):
     df = load(ticker)
     df = build_features(df)
 
-    # 动态匹配目标与参数
-    horizon_sec = 30.0 if ticker in ["INTC", "GOOG"] else 5.0
-    side = "buy"  # 统一以 Buy 侧作为 Research 标尺
+    horizon_sec = 10.0
+    side = "buy"
+    target_col = "smooth_wmid"
 
-    raw_col = "exec_buy"
-    target_col = "smooth_wmid" if ticker in ["INTC", "GOOG"] else f"smooth_{side}"
-
-    # 预计算全局平滑用于 Goal 1 & 2
-    df[target_col] = smooth_time(
-        df["wmid"].values if ticker in ["INTC", "GOOG"] else df[raw_col].values,
-        df["Time"],
-        halflife_sec=5.0,
-    )
+    df[target_col] = smooth_time(df["wmid"].values, df["Time"], halflife_sec=5.0)
 
     # Goal 1: Regime-Conditioned IC
     regime_ic_analysis(df, target_col, horizon_sec)
