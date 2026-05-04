@@ -92,28 +92,35 @@ if __name__ == "__main__":
         output_name = f"results/{ticker}_backtest_result.csv"
         result_df.to_csv(output_name, index=False)
 
-        print(f"Backtested {ticker}. Results saved to {output_name}.")
-        print("-" * 30)
+        print(f">>> {ticker} Results saved to {output_name}.")
 
-        imp_series = result_df["Improvement_bps"]
-        mean_imp = imp_series.mean()
-        std_imp = imp_series.std()
+        for side in ["BUY", "SELL"]:
+            side_df = result_df[result_df["Side"] == side]
+            imp_series = side_df["Improvement_bps"]
 
-        t_stat, p_val = stats.ttest_1samp(imp_series, 0)
+            if len(imp_series) > 1:
+                mean_imp = imp_series.mean()
+                std_imp = imp_series.std()
+                t_stat, p_val = stats.ttest_1samp(imp_series, 0)
+            else:
+                mean_imp, std_imp, t_stat, p_val = 0.0, 0.0, 0.0, 1.0
 
-        print(
-            f">>> {ticker} Statistics | Mean: {mean_imp:.4f} bps | Std: {std_imp:.4f} | T-Stat: {t_stat:.4f} (p-val: {p_val:.4f})"
-        )
+            print(
+                f"    [{side:4s}] Mean: {mean_imp:>7.4f} bps | Std: {std_imp:>6.4f} | T-Stat: {t_stat:>7.4f} (p-val: {p_val:>6.4f})"
+            )
 
-        summary_data.append(
-            {
-                "Ticker": ticker,
-                "Mean_Improvement": mean_imp,
-                "Std_Improvement": std_imp,
-                "T_Statistic": t_stat,
-                "P_Value": p_val,
-            }
-        )
+            summary_data.append(
+                {
+                    "Ticker": ticker,
+                    "Side": side,
+                    "Mean_Improvement": mean_imp,
+                    "Std_Improvement": std_imp,
+                    "T_Statistic": t_stat,
+                    "P_Value": p_val,
+                }
+            )
+
+        print("-" * 70)
 
     if summary_data:
         summary_df = pd.DataFrame(summary_data)
