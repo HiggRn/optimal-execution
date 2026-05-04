@@ -1,33 +1,47 @@
 import math
-from collections import deque
 from typing import Optional
 
 import pandas as pd
 
 from base_strategy import BaseStrategy
 
+# 依据 Notebook 物理规律设定的先验权重
+PRIOR_WEIGHTS = {
+    "W_rev": 1.0,  # 微观均值回归权重
+    "W_trend": 0.5,  # 宏观低频漂移权重
+    "W_risk": 1.65,  # 方差风险惩罚系数 (90% Confidence)
+}
 
-class TimeRollingSum:
-    __slots__ = ("_window_sec", "_buf", "_total")
 
-    def __init__(self, window_sec: float) -> None:
-        self._window_sec = window_sec
-        self._buf: deque[tuple[pd.Timestamp, float]] = deque()
-        self._total: float = 0.0
+class OnlineEstimator:
+    """依据 Lecture 12 Notebook 实现的 O(1) 在线均值与方差估计器"""
 
-    def _evict(self, current_time: pd.Timestamp) -> None:
-        cutoff = current_time - pd.Timedelta(seconds=self._window_sec)
-        while self._buf and self._buf[0][0] < cutoff:
-            _, v = self._buf.popleft()
-            self._total -= v
+    __slots__ = ("alpha", "mean", "var")
 
-    def read(self, current_time: pd.Timestamp) -> float:
-        self._evict(current_time)
-        return self._total
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.mean: Optional[float] = None
+        self.var: float = 0.0
 
-    def push(self, current_time: pd.Timestamp, val: float) -> None:
-        self._buf.append((current_time, val))
-        self._total += val
+    def update(self, x: float) -> None:
+        if math.isnan(x):
+            return
+
+        if self.mean is None:
+            self.mean = x
+            self.var = 0.0
+        else:
+            # 公式: m_t = alpha * m_{t-1} + (1 - alpha) * x_t
+            old_mean = self.mean
+            self.mean = self.alpha * self.mean + (1.0 - self.alpha) * x
+            # 公式: v_t = alpha * v_{t-1} + (1 - alpha) * (x_t - m_t)^2
+            self.var = self.alpha * self.var + (1.0 - self.alpha) * (
+                (x - self.mean) ** 2
+            )
+
+    @property
+    def vol(self) -> float:
+        return math.sqrt(self.var)
 
 
 class Strategy(BaseStrategy):
@@ -37,19 +51,15 @@ class Strategy(BaseStrategy):
         self._executed: bool = False
         self._arrival_price: Optional[float] = None
 
-        self._obi_buf = deque(maxlen=100)
-        self._spread_buf = deque(maxlen=100)
-        self._mid_buf = deque(maxlen=50)
-
-        self._buy_flow = TimeRollingSum(3.0)
-        self._sell_flow = TimeRollingSum(3.0)
+        # 在线估计器 (跨分钟保持状态，不清空)
+        self._mid_fast = OnlineEstimator(alpha=0.98)  # 捕捉高频反转
+        self._mid_slow = OnlineEstimator(alpha=0.999)  # 捕捉低频趋势
+        self._spread_ema = OnlineEstimator(alpha=0.99)  # 捕捉动态流动性成本
 
     def _reset_minute(self):
         self._executed = False
         self._arrival_price = None
-        self._obi_buf.clear()
-        self._spread_buf.clear()
-        self._mid_buf.clear()
+        # 注意：这里绝对不能清空 OnlineEstimator，保证行情的连续性
 
     def on_tick(self, current_row: pd.Series, current_time: pd.Timestamp) -> bool:
         minute = current_time.floor("min")
@@ -61,84 +71,68 @@ class Strategy(BaseStrategy):
 
         bid1 = float(current_row["BidPrice_1"])
         ask1 = float(current_row["AskPrice_1"])
-        bsz1 = float(current_row["BidSize_1"])
-        asz1 = float(current_row["AskSize_1"])
+
+        mid = (ask1 + bid1) * 0.5
+        spread = ask1 - bid1
 
         if self._arrival_price is None:
             self._arrival_price = ask1 if self.side == "BUY" else bid1
 
-        spread = ask1 - bid1
-        mid = (ask1 + bid1) * 0.5
-        self._spread_buf.append(spread)
-        self._mid_buf.append(mid)
-
-        micro = (ask1 * bsz1 + bid1 * asz1) / (bsz1 + asz1 + 1e-9)
-        micro_edge = micro - mid
-
-        vis_exec = float(current_row.get("VisibleExecution_1=Yes_0=No", 0) or 0)
-        hid_exec = float(current_row.get("HiddenExecution_1=Yes_0=No", 0) or 0)
-        direction = float(current_row.get("Direction_1=Buy_-1=Sell", 0) or 0)
-        size = float(current_row.get("Size", 0) or 0)
-
-        is_exec = (vis_exec == 1.0) or (hid_exec == 1.0)
-        exec_vol = size if is_exec else 0.0
-
-        self._buy_flow.push(current_time, exec_vol if direction == 1.0 else 0.0)
-        self._sell_flow.push(current_time, exec_vol if direction == -1.0 else 0.0)
-
-        bid_v = sum(float(current_row.get(f"BidSize_{i}", 0) or 0) for i in range(1, 6))
-        ask_v = sum(float(current_row.get(f"AskSize_{i}", 0) or 0) for i in range(1, 6))
-        obi = (bid_v - ask_v) / (bid_v + ask_v + 1e-9)
-        self._obi_buf.append(obi)
+        # 1. O(1) 在线更新状态
+        self._mid_fast.update(mid)
+        self._mid_slow.update(mid)
+        self._spread_ema.update(spread)
 
         fire = False
         if not self._executed:
+            # 强制执行兜底
             if sec >= 55.0:
                 fire = True
-            elif sec >= 2.0 and len(self._obi_buf) >= 30:
-                obi_mean = sum(self._obi_buf) / len(self._obi_buf)
-                variance = sum((x - obi_mean) ** 2 for x in self._obi_buf) / len(
-                    self._obi_buf
+            # 等待开局 2 秒以确保 Online Estimator 收集到初始方差
+            elif sec >= 2.0 and self._mid_fast.mean is not None:
+                # 时间衰减因子 (1.0 -> 0.0)
+                tau = max(0.0, (55.0 - sec) / 53.0)
+
+                # 动态执行门槛 (Dynamic Threshold)
+                current_spread_cost = (
+                    self._spread_ema.mean if self._spread_ema.mean else spread
                 )
-                obi_std = math.sqrt(variance) + 1e-9
-                obi_z = (obi - obi_mean) / obi_std
+                threshold = current_spread_cost * tau
 
-                local_mid_mean = sum(self._mid_buf) / len(self._mid_buf)
-                is_downward_trend = local_mid_mean < self._arrival_price
+                # 提取先验参数
+                w_rev = PRIOR_WEIGHTS["W_rev"]
+                w_trend = PRIOR_WEIGHTS["W_trend"]
+                w_risk = PRIOR_WEIGHTS["W_risk"]
 
-                is_fav_regime = (self.side == "BUY" and is_downward_trend) or (
-                    self.side == "SELL" and not is_downward_trend
-                )
+                sigma_fast = self._mid_fast.vol
 
-                curr_p = ask1 if self.side == "BUY" else bid1
-                profit_usd = (
-                    (self._arrival_price - curr_p)
-                    if self.side == "BUY"
-                    else (curr_p - self._arrival_price)
-                )
-
-                time_fraction_left = max(0.0, (55.0 - sec) / 53.0)
-                local_spread_mean = sum(self._spread_buf) / len(self._spread_buf)
-
+                # 2. 计算连续预期优势方程 (Expected Edge)
                 if self.side == "BUY":
-                    fav_obi_z = obi_z
-                    fav_micro_edge = micro_edge
-                else:
-                    fav_obi_z = -obi_z
-                    fav_micro_edge = -micro_edge
+                    profit = self._arrival_price - ask1
+                    micro_reversion = self._mid_fast.mean - mid
+                    macro_trend = self._mid_slow.mean - self._arrival_price
 
-                if is_fav_regime:
-                    expected_profit_usd = 1.5 * local_spread_mean * time_fraction_left
-                    reversion_signal = (fav_obi_z > 0.5) and (fav_micro_edge > 0)
-                    panic_signal = fav_obi_z > 1.5
-                else:
-                    expected_profit_usd = 0.5 * local_spread_mean * time_fraction_left
-                    reversion_signal = (fav_obi_z < 0.8) and (fav_micro_edge < 0.5)
-                    panic_signal = fav_obi_z < 0.0
+                    expected_edge = (
+                        profit
+                        + w_rev * micro_reversion
+                        + w_trend * macro_trend
+                        - w_risk * sigma_fast * tau
+                    )
 
-                if profit_usd >= expected_profit_usd and reversion_signal:
-                    fire = True
-                elif profit_usd < 0 and panic_signal:
+                else:  # SELL
+                    profit = bid1 - self._arrival_price
+                    micro_reversion = mid - self._mid_fast.mean
+                    macro_trend = self._arrival_price - self._mid_slow.mean
+
+                    expected_edge = (
+                        profit
+                        + w_rev * micro_reversion
+                        + w_trend * macro_trend
+                        - w_risk * sigma_fast * tau
+                    )
+
+                # 3. 最优停止判决
+                if expected_edge > threshold:
                     fire = True
 
         if fire:
