@@ -63,35 +63,58 @@ def add_heuristic_signal(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df = df.copy()
     df["heuristic_signal"] = 0.0
 
-    # regime division (e.g. spread_bps < 2 - tight)
-    spread_q33 = df["spread_bps"].quantile(0.33)
-    spread_q66 = df["spread_bps"].quantile(0.66)
+    # 1. EMA Spread baseline
+    spread_baseline = df["spread_bps"].ewm(span=2000, min_periods=100).mean()
+
+    # regime division
+    cond_tight = df["spread_bps"] < spread_baseline * 0.90
+    cond_wide = df["spread_bps"] > spread_baseline * 1.10
+    cond_normal = ~(cond_tight | cond_wide)
 
     if ticker in ["INTC", "MSFT"]:
         # large tick: linear combinaton
         df["heuristic_signal"] = (
             1.0 * df["oib_wgt"] + 0.5 * df["tflow_20"] - 0.5 * df["bid_slope"]
         )
+    elif ticker == "AMZN":
+        # small tick (AMZN): decision tree
+        # Tight: OIB not trustworthy, use trade flow & bid slope
+        df.loc[cond_tight, "heuristic_signal"] = (
+            1.0 * df["tflow_20"] + 0.5 * df["bid_slope"]
+        )
+        # Normal: mid land
+        df.loc[cond_normal, "heuristic_signal"] = (
+            -0.5 * df["oib_wgt"] + 0.5 * df["bid_slope"]
+        )
+        # Wide: real liquidty leaves
+        df.loc[cond_wide, "heuristic_signal"] = (
+            -1.0 * df["oib_wgt"] + 0.5 * df["bid_slope"]
+        )
+    elif ticker == "GOOG":
+        # small tick (AMZN): decision tree
+        # Tight: OIB & slope positive
+        df.loc[cond_tight, "heuristic_signal"] = (
+            1.0 * df["bid_slope"] + 1.0 * df["oib_wgt"]
+        )
+        # Normal: mid land
+        df.loc[cond_normal, "heuristic_signal"] = (
+            0.5 * df["oib_wgt"] - 0.5 * df["bid_slope"]
+        )
+        # Wide: spread open, OIB positive, slope in reverse
+        df.loc[cond_wide, "heuristic_signal"] = (
+            1.0 * df["oib_wgt"] - 1.5 * df["bid_slope"]
+        )
 
-    elif ticker in ["AMZN", "GOOG"]:
-        # small tick: decision tree
-        cond_tight = df["spread_bps"] <= spread_q33
-        cond_normal = (df["spread_bps"] > spread_q33) & (df["spread_bps"] <= spread_q66)
-        cond_wide = df["spread_bps"] > spread_q66
-
-        if ticker == "GOOG":
-            df.loc[cond_tight, "heuristic_signal"] = df["bid_slope"]
-            df.loc[cond_wide, "heuristic_signal"] = (
-                df["oib_wgt"] - 1.5 * df["bid_slope"]
-            )
-
-        elif ticker == "AMZN":
-            df.loc[cond_tight, "heuristic_signal"] = df["bid_slope"]
-            df.loc[cond_wide, "heuristic_signal"] = -1.0 * df["oib_wgt"] + df["bid_pos"]
-
-    # normalization
+    # 2. rolling z-score
     s = df["heuristic_signal"]
-    df["heuristic_signal"] = (s - s.mean()) / (s.std() + 1e-9)
+
+    roll_mean = s.ewm(span=2000, min_periods=100).mean()
+    roll_std = s.ewm(span=2000, min_periods=100).std()
+
+    roll_mean = roll_mean.fillna(s.expanding().mean())
+    roll_std = roll_std.fillna(s.expanding().std())
+
+    df["heuristic_signal"] = (s - roll_mean) / (roll_std + 1e-9)
 
     return df
 
