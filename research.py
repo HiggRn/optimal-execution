@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from scipy.stats import spearmanr
+from scipy.signal import savgol_filter
 import statsmodels.api as sm
 
 warnings.filterwarnings("ignore")
@@ -136,9 +137,26 @@ FEATURE_COLS = [
 def smooth_time(
     prices: np.ndarray, times: pd.Series, halflife_sec: float
 ) -> np.ndarray:
-    s = pd.Series(prices, index=times)
-    hl = pd.Timedelta(f"{halflife_sec}s")
-    return s.ewm(halflife=hl, times=times, adjust=False).mean().values
+    n = len(prices)
+    if n < 10:
+        return prices
+
+    total_sec = (times.iloc[-1] - times.iloc[0]).total_seconds()
+    ticks_per_sec = n / (total_sec + 1e-9)
+
+    window_ticks = int(ticks_per_sec * halflife_sec)
+
+    if window_ticks % 2 == 0:
+        window_ticks += 1
+
+    window_ticks = max(3, min(window_ticks, n - 1 if (n - 1) % 2 != 0 else n - 2))
+
+    try:
+        smoothed = savgol_filter(prices, window_length=window_ticks, polyorder=2)
+    except ValueError:
+        smoothed = prices
+
+    return smoothed
 
 
 def local_dir(
