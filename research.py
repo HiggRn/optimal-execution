@@ -1,12 +1,12 @@
 import warnings
 
-warnings.filterwarnings("ignore")
-
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from scipy.stats import spearmanr
 import statsmodels.api as sm
+
+warnings.filterwarnings("ignore")
 
 TICKERS = ["AMZN", "GOOG", "INTC", "MSFT"]
 DATA_DIR = Path("./data")
@@ -55,6 +55,43 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     roll_sv = df["signed_vol"].rolling(20, min_periods=1)
     roll_v = df["Size"].rolling(20, min_periods=1)
     df["tflow_20"] = roll_sv.sum() / (roll_v.sum() + 1e-9)
+
+    return df
+
+
+def add_heuristic_signal(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    df = df.copy()
+    df["heuristic_signal"] = 0.0
+
+    # regime division (e.g. spread_bps < 2 - tight)
+    spread_q33 = df["spread_bps"].quantile(0.33)
+    spread_q66 = df["spread_bps"].quantile(0.66)
+
+    if ticker in ["INTC", "MSFT"]:
+        # large tick: linear combinaton
+        df["heuristic_signal"] = (
+            1.0 * df["oib_wgt"] + 0.5 * df["tflow_20"] - 0.5 * df["bid_slope"]
+        )
+
+    elif ticker in ["AMZN", "GOOG"]:
+        # small tick: decision tree
+        cond_tight = df["spread_bps"] <= spread_q33
+        cond_normal = (df["spread_bps"] > spread_q33) & (df["spread_bps"] <= spread_q66)
+        cond_wide = df["spread_bps"] > spread_q66
+
+        if ticker == "GOOG":
+            df.loc[cond_tight, "heuristic_signal"] = df["bid_slope"]
+            df.loc[cond_wide, "heuristic_signal"] = (
+                df["oib_wgt"] - 1.5 * df["bid_slope"]
+            )
+
+        elif ticker == "AMZN":
+            df.loc[cond_tight, "heuristic_signal"] = df["bid_slope"]
+            df.loc[cond_wide, "heuristic_signal"] = -1.0 * df["oib_wgt"] + df["bid_pos"]
+
+    # normalization
+    s = df["heuristic_signal"]
+    df["heuristic_signal"] = (s - s.mean()) / (s.std() + 1e-9)
 
     return df
 
@@ -123,7 +160,7 @@ def regime_ic_analysis(df: pd.DataFrame, target_col: str, horizon_sec: float):
 
     print(f"\n--- Goal 1: Regime-Conditioned IC (Horizon: {horizon_sec}s) ---")
 
-    features_to_check = ["oib_wgt", "bid_pos", "bid_slope"]
+    features_to_check = ["oib_wgt", "bid_pos", "bid_slope", "heuristic_signal"]
     for feat in features_to_check:
         if feat not in df.columns:
             continue
@@ -149,7 +186,8 @@ def multivariate_ols_analysis(df: pd.DataFrame, target_col: str, horizon_sec: fl
 
     print(f"\n--- Goal 2: Multivariate OLS Regression (Horizon: {horizon_sec}s) ---")
 
-    X_cols = ["oib_wgt", "bid_pos", "bid_slope", "tflow_20"]
+    # X_cols = ["oib_wgt", "bid_pos", "bid_slope", "tflow_20"]
+    X_cols = ["heuristic_signal"]
 
     reg_df = df[X_cols].copy()
     reg_df["Target"] = future_ret
@@ -230,6 +268,9 @@ def run_research(ticker: str):
 
     df = load(ticker)
     df = build_features(df)
+
+    df = add_heuristic_signal(df, ticker)
+    FEATURE_COLS.append("heuristic_signal")
 
     horizon_sec = 10.0
     target_col = "smooth_wmid"
