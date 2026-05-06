@@ -1,16 +1,32 @@
+import math
+
 import numpy as np
 from base_strategy import BaseStrategy
 
 
 class Strategy(BaseStrategy):
-    def __init__(self, side, window=100):
+    def __init__(self, side, window=100, tau=5.0):
         super().__init__(side)
         self.window = window
         self.history = []
         self.daily_return = 0.0
         self.tick_size = 0.01
 
+        self.avg_spread = None
+        self.prev_time = None
+        self.tau = tau
+
     def on_tick(self, row, current_time) -> bool:
+        current_spread = row["AskPrice_1"] - row["BidPrice_1"]
+
+        if self.avg_spread is None or self.prev_time is None:
+            self.avg_spread = current_spread
+        else:
+            dt = (current_time - self.prev_time).total_seconds()
+            decay = math.exp(-dt / self.tau)
+            self.avg_spread = current_spread * (1 - decay) + self.avg_spread * decay
+        self.prev_time = current_time
+
         self.history.append(row)
         if len(self.history) < 2:
             return False
@@ -23,36 +39,32 @@ class Strategy(BaseStrategy):
         ) / self.history[0]["MidPrice"]
 
         return should_execute(
-            row, self.history, self.side, self.daily_return, self.tick_size
+            row,
+            self.history,
+            self.side,
+            self.daily_return,
+            self.tick_size,
+            self.avg_spread,
         )
 
 
-def should_execute(current, history, side, daily_trend, tick_size) -> bool:
-    # 1. Feature extraction
+def should_execute(current, history, side, daily_trend, tick_size, avg_spread) -> bool:
     imbalance = (current["BidSize_1"] - current["AskSize_1"]) / (
         current["BidSize_1"] + current["AskSize_1"]
     )
-    spread = current["AskPrice_1"] - current["BidPrice_1"]
-    is_large_tick = spread <= 1.01 * tick_size
 
-    # 2. Price momentum
-    mid_change = current["MidPrice"] - history[-2]["MidPrice"]
+    is_large_tick = avg_spread <= 1.5 * tick_size
 
-    # 3. Global trend adjustment
     trend_adj = np.clip(daily_trend * 10, -0.2, 0.2)
 
     if side == "BUY":
-        # - Large Tick: imbalance is high
-        # - Small Tick: mid price starts to fall
         if is_large_tick:
             return imbalance > (0.6 - trend_adj)
         else:
-            return mid_change < 0 and imbalance > (0.4 - trend_adj)
+            return imbalance > (0.2 - trend_adj)
 
     else:  # SIDE == "SELL"
-        # - Large Tick: imbalance is low
-        # - Small Tick: mid price starts to rise
         if is_large_tick:
             return imbalance < (-0.6 - trend_adj)
         else:
-            return mid_change > 0 and imbalance < (-0.4 - trend_adj)
+            return imbalance < (-0.2 - trend_adj)
