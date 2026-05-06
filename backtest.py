@@ -2,6 +2,7 @@ import os
 
 import pandas as pd
 from scipy import stats
+from tqdm import tqdm
 
 from zijie_strategy import Strategy
 
@@ -11,7 +12,7 @@ def run_backtest(df, strategy_class, *args, **kwargs):
 
     for side in ["BUY", "SELL"]:
         strat = strategy_class(side, *args, **kwargs)
-        for minute, grp in df.groupby("Minute"):
+        for minute, grp in tqdm(df.groupby("Minute")):
             twap_price = (
                 grp["AskPrice_1"].iloc[0]
                 if side == "BUY"
