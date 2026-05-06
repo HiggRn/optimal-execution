@@ -60,58 +60,51 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_heuristic_signal(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+def add_heuristic_signal(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["heuristic_signal"] = 0.0
 
-    # 1. EMA Spread baseline
-    spread_baseline = df["spread_bps"].ewm(span=2000, min_periods=100).mean()
+    # 1. determine large tick or small tick
+    burn_in_spreads = df["Spread"].iloc[:2000]
+    min_spread = burn_in_spreads.min()
 
-    # regime division
+    pinned_ratio = (burn_in_spreads <= min_spread * 1.1).mean()
+
+    is_large_tick = pinned_ratio > 0.15
+
+    print(
+        f"  [Auto-Detect] Pinned Ratio: {pinned_ratio:.1%} -> "
+        f"{'Large Tick (Linear)' if is_large_tick else 'Small Tick (Regime)'}"
+    )
+
+    # 2. dynamic spread state
+    spread_baseline = df["spread_bps"].ewm(span=2000, min_periods=100).mean()
     cond_tight = df["spread_bps"] < spread_baseline * 0.90
     cond_wide = df["spread_bps"] > spread_baseline * 1.10
     cond_normal = ~(cond_tight | cond_wide)
 
-    if ticker in ["INTC", "MSFT"]:
-        # large tick: linear combinaton
+    # 3. dynamic signal based on large tick or not
+    if is_large_tick:
+        # large tick
         df["heuristic_signal"] = (
             1.0 * df["oib_wgt"] + 0.5 * df["tflow_20"] - 0.5 * df["bid_slope"]
         )
-    elif ticker == "AMZN":
-        # small tick (AMZN): decision tree
-        # Tight: OIB not trustworthy, use trade flow & bid slope
+    else:
+        # small tick
         df.loc[cond_tight, "heuristic_signal"] = (
-            1.0 * df["tflow_20"] + 0.5 * df["bid_slope"]
+            -1.0 * df["bid_slope"] - 1.0 * df["oib_wgt"]
         )
-        # Normal: mid land
         df.loc[cond_normal, "heuristic_signal"] = (
-            -0.5 * df["oib_wgt"] + 0.5 * df["bid_slope"]
+            -0.5 * df["oib_wgt"] - 0.5 * df["bid_slope"]
         )
-        # Wide: real liquidty leaves
         df.loc[cond_wide, "heuristic_signal"] = (
-            -1.0 * df["oib_wgt"] + 0.5 * df["bid_slope"]
-        )
-    elif ticker == "GOOG":
-        # small tick (AMZN): decision tree
-        # Tight: OIB & slope positive
-        df.loc[cond_tight, "heuristic_signal"] = (
-            1.0 * df["bid_slope"] + 1.0 * df["oib_wgt"]
-        )
-        # Normal: mid land
-        df.loc[cond_normal, "heuristic_signal"] = (
-            0.5 * df["oib_wgt"] - 0.5 * df["bid_slope"]
-        )
-        # Wide: spread open, OIB positive, slope in reverse
-        df.loc[cond_wide, "heuristic_signal"] = (
-            1.0 * df["oib_wgt"] - 1.5 * df["bid_slope"]
+            -1.0 * df["oib_wgt"] - 1.5 * df["bid_slope"]
         )
 
-    # 2. rolling z-score
+    # 4. rolling z-score
     s = df["heuristic_signal"]
-
     roll_mean = s.ewm(span=2000, min_periods=100).mean()
     roll_std = s.ewm(span=2000, min_periods=100).std()
-
     roll_mean = roll_mean.fillna(s.expanding().mean())
     roll_std = roll_std.fillna(s.expanding().std())
 
@@ -310,7 +303,7 @@ def run_research(ticker: str):
     df = load(ticker)
     df = build_features(df)
 
-    df = add_heuristic_signal(df, ticker)
+    df = add_heuristic_signal(df)
     FEATURE_COLS.append("heuristic_signal")
 
     horizon_sec = 10.0
