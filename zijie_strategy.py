@@ -47,7 +47,7 @@ def should_execute(current, history, side, daily_trend, tick_size) -> bool:
         if is_large_tick:
             return imbalance > (0.6 - trend_adj)
         else:
-            return mid_change < 0 and imbalance > (0.2 - trend_adj)
+            return mid_change < 0 and imbalance > (0.4 - trend_adj)
 
     else:  # SIDE == "SELL"
         # - Large Tick: imbalance is low
@@ -55,4 +55,4 @@ def should_execute(current, history, side, daily_trend, tick_size) -> bool:
         if is_large_tick:
             return imbalance < (-0.6 - trend_adj)
         else:
-            return mid_change > 0 and imbalance < (-0.2 - trend_adj)
+            return mid_change > 0 and imbalance < (-0.4 - trend_adj)
