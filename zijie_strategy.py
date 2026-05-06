@@ -9,12 +9,14 @@ class Strategy(BaseStrategy):
         super().__init__(side)
         self.window = window
         self.history = []
-        self.daily_return = 0.0
         self.tick_size = 0.01
 
         self.avg_spread = None
         self.prev_time = None
         self.tau = tau
+
+        self.ema_fast = None
+        self.ema_slow = None
 
     def on_tick(self, row, current_time) -> bool:
         current_spread = row["AskPrice_1"] - row["BidPrice_1"]
@@ -25,6 +27,11 @@ class Strategy(BaseStrategy):
             dt = (current_time - self.prev_time).total_seconds()
             decay = math.exp(-dt / self.tau)
             self.avg_spread = current_spread * (1 - decay) + self.avg_spread * decay
+
+        self.ema_fast, self.ema_slow, macd_trend = update_macd_trend(
+            row, current_time, self.prev_time, self.ema_fast, self.ema_slow
+        )
+
         self.prev_time = current_time
 
         self.history.append(row)
@@ -34,17 +41,13 @@ class Strategy(BaseStrategy):
         if len(self.history) > self.window:
             self.history.pop(0)
 
-        self.daily_return = (
-            row["MidPrice"] - self.history[0]["MidPrice"]
-        ) / self.history[0]["MidPrice"]
-
         return should_execute(
-            row,
-            self.history,
-            self.side,
-            self.daily_return,
-            self.tick_size,
-            self.avg_spread,
+            current=row,
+            history=self.history,
+            side=self.side,
+            daily_trend=macd_trend,
+            tick_size=self.tick_size,
+            avg_spread=self.avg_spread,
         )
 
 
@@ -102,3 +105,27 @@ def calculate_rolling_ofi(history) -> float:
         total_ofi += bid_flow - ask_flow
 
     return total_ofi
+
+
+def update_macd_trend(
+    row, current_time, prev_time, ema_fast, ema_slow, tau_fast=5.0, tau_slow=60.0
+):
+    current_spread = row["AskPrice_1"] - row["BidPrice_1"]
+    current_vol = row["BidSize_1"] + row["AskSize_1"]
+
+    imbalance_ratio = row["BidSize_1"] / current_vol if current_vol > 0 else 0.5
+    micro_price = row["BidPrice_1"] + imbalance_ratio * current_spread
+
+    if prev_time is None or ema_fast is None or ema_slow is None:
+        return micro_price, micro_price, 0.0
+
+    dt = (current_time - prev_time).total_seconds()
+    decay_fast = math.exp(-dt / tau_fast)
+    decay_slow = math.exp(-dt / tau_slow)
+
+    new_ema_fast = micro_price * (1 - decay_fast) + ema_fast * decay_fast
+    new_ema_slow = micro_price * (1 - decay_slow) + ema_slow * decay_slow
+
+    macd_trend = (new_ema_fast - new_ema_slow) / new_ema_slow
+
+    return new_ema_fast, new_ema_slow, macd_trend
