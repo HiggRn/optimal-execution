@@ -15,4 +15,4 @@ Note that the `data` folder is not included.
 2. Global trend: To account for macro trends during high-frequency execution, the strategy fine-tunes execution urgency within each minute by adjusting thresholds. This is implemented using MACD (Moving Average Convergence Divergence).
 3. Execution timing: This is the core of the strategy, determining the optimal moment to execute within a one-minute window. If no signal is triggered, the strategy falls back to execution at the end of the minute.
     - Large-tick stocks: Characterized by thick order books; timing is driven by Order Book Imbalance (OBI).
-    - Small-tick stocks: Characterized by thin order books; timing is driven by Order Flow Imbalance (OFI) over a rolling window.
+    - Small-tick stocks: Characterized by thin order books; timing is driven by Trade Flow Imbalance (TFI) over a rolling window.
