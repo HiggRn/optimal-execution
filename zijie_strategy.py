@@ -1,3 +1,4 @@
+from collections import deque
 import math
 
 import numpy as np
@@ -8,7 +9,8 @@ class Strategy(BaseStrategy):
     def __init__(self, side, window=100, tau=5.0):
         super().__init__(side)
         self.window = window
-        self.history = []
+        self.history = deque(maxlen=window)
+        self.rolling_ofi = 0.0
         self.tick_size = 0.01
 
         self.avg_spread = None
@@ -34,31 +36,38 @@ class Strategy(BaseStrategy):
 
         self.prev_time = current_time
 
-        self.history.append(row)
-        if len(self.history) < 2:
-            return False
+        if self.history:
+            prev = self.history[-1]
+            delta = compute_ofi_delta(row, prev)
+            self.rolling_ofi += delta
 
-        if len(self.history) > self.window:
-            self.history.pop(0)
+        if len(self.history) == self.window:
+            old_prev = self.history[0]
+            old_next = self.history[1]
+            self.rolling_ofi -= compute_ofi_delta(old_next, old_prev)
+
+        self.history.append(row)
 
         return should_execute(
             current=row,
-            history=self.history,
+            rolling_ofi=self.rolling_ofi,
             side=self.side,
-            daily_trend=macd_trend,
+            macro_trend=macd_trend,
             tick_size=self.tick_size,
             avg_spread=self.avg_spread,
         )
 
 
-def should_execute(current, history, side, daily_trend, tick_size, avg_spread) -> bool:
+def should_execute(
+    current, rolling_ofi, side, macro_trend, tick_size, avg_spread
+) -> bool:
     imbalance = (current["BidSize_1"] - current["AskSize_1"]) / (
         current["BidSize_1"] + current["AskSize_1"]
     )
 
     is_large_tick = avg_spread <= 1.5 * tick_size
 
-    trend_adj = np.clip(daily_trend * 10, -0.2, 0.2)
+    trend_adj = np.clip(macro_trend * 10, -0.2, 0.2)
 
     if is_large_tick:
         if side == "BUY":
@@ -66,8 +75,6 @@ def should_execute(current, history, side, daily_trend, tick_size, avg_spread) -
         else:  # SELL
             return imbalance < (-0.6 - trend_adj)
     else:  # small tick
-        rolling_ofi = calculate_rolling_ofi(history)
-
         current_volume = current["BidSize_1"] + current["AskSize_1"]
         ofi_norm = rolling_ofi / current_volume if current_volume > 0 else 0.0
 
@@ -77,34 +84,24 @@ def should_execute(current, history, side, daily_trend, tick_size, avg_spread) -
             return ofi_norm < (-2.0 - trend_adj * 5)
 
 
-def calculate_rolling_ofi(history) -> float:
-    if len(history) < 2:
-        return 0.0
+def compute_ofi_delta(curr, prev):
+    # Bid
+    if curr["BidPrice_1"] > prev["BidPrice_1"]:
+        bid_flow = curr["BidSize_1"]
+    elif curr["BidPrice_1"] == prev["BidPrice_1"]:
+        bid_flow = curr["BidSize_1"] - prev["BidSize_1"]
+    else:
+        bid_flow = -prev["BidSize_1"]
 
-    total_ofi = 0.0
-    for i in range(1, len(history)):
-        curr = history[i]
-        prev = history[i - 1]
+    # Ask
+    if curr["AskPrice_1"] < prev["AskPrice_1"]:
+        ask_flow = curr["AskSize_1"]
+    elif curr["AskPrice_1"] == prev["AskPrice_1"]:
+        ask_flow = curr["AskSize_1"] - prev["AskSize_1"]
+    else:
+        ask_flow = -prev["AskSize_1"]
 
-        # Bid side OFI
-        if curr["BidPrice_1"] > prev["BidPrice_1"]:
-            bid_flow = curr["BidSize_1"]
-        elif curr["BidPrice_1"] == prev["BidPrice_1"]:
-            bid_flow = curr["BidSize_1"] - prev["BidSize_1"]
-        else:
-            bid_flow = -prev["BidSize_1"]
-
-        # Ask side OFI
-        if curr["AskPrice_1"] < prev["AskPrice_1"]:
-            ask_flow = curr["AskSize_1"]
-        elif curr["AskPrice_1"] == prev["AskPrice_1"]:
-            ask_flow = curr["AskSize_1"] - prev["AskSize_1"]
-        else:
-            ask_flow = -prev["AskSize_1"]
-
-        total_ofi += bid_flow - ask_flow
-
-    return total_ofi
+    return bid_flow - ask_flow
 
 
 def update_macd_trend(
