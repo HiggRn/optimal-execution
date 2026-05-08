@@ -121,6 +121,15 @@ if __name__ == "__main__":
                 }
             )
 
+        total_buy_exec = result_df.loc[result_df["Side"] == "BUY", "Exec_Price"].sum()
+        total_sell_exec = result_df.loc[result_df["Side"] == "SELL", "Exec_Price"].sum()
+        total_buy_twap = result_df.loc[result_df["Side"] == "BUY", "TWAP_Price"].sum()
+        total_sell_twap = result_df.loc[result_df["Side"] == "SELL", "TWAP_Price"].sum()
+        pct_improv = 100 - 100 * (total_buy_exec - total_sell_exec) / (
+            total_buy_twap - total_sell_twap
+        )
+        print(f"Percentage Improvement: {pct_improv:>7.4f}%")
+
         print("-" * 70)
 
     if summary_data:
