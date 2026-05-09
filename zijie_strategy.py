@@ -95,7 +95,7 @@ def should_execute(
         if sec > 40.0:
             urgency = (60.0 - sec) / 20.0
 
-        trigger_tfi = 2.0 * urgency
+        trigger_tfi = 1.5 * urgency
 
         safe_spread = max(2.0 * tick_size, median_spread)
         if sec >= 58.0 and current_spread <= (safe_spread + tick_size + 1e-5):
