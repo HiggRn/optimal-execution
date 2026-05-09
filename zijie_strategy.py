@@ -98,9 +98,6 @@ def should_execute(
         trigger_tfi = 1.5 * urgency
 
         safe_spread = max(2.0 * tick_size, median_spread)
-        if sec >= 58.0 and current_spread <= (safe_spread + tick_size + 1e-5):
-            return True
-
         if current_spread > safe_spread + 1e-5:
             return False
 
