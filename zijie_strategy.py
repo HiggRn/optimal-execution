@@ -97,10 +97,11 @@ def should_execute(
 
         trigger_tfi = 2.0 * urgency
 
-        if sec >= 58.0 and current_spread <= (median_spread + tick_size + 1e-5):
+        safe_spread = max(2.0 * tick_size, median_spread)
+        if sec >= 58.0 and current_spread <= (safe_spread + tick_size + 1e-5):
             return True
 
-        if current_spread > median_spread * 1.2:
+        if current_spread > safe_spread + 1e-5:
             return False
 
         if side == "BUY":
