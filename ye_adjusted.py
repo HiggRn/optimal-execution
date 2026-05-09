@@ -7,6 +7,7 @@ import pandas as pd
 
 from base_strategy import BaseStrategy
 
+
 # 0. Global configuration
 
 BASE_PARAMS: dict = {
@@ -56,9 +57,8 @@ BASE_PARAMS: dict = {
 }
 
 
-# Stock-specific adjustment.
-# AMZN / GOOG worked better, so we keep them moderately selective.
-# INTC / MSFT were weaker, so we make them more conservative.
+# Four separate stock-specific algorithms for the original four stocks.
+# These are fixed before the final test data.
 STOCK_PARAMS: dict = {
     "AMZN": {
         "min_trade_sec": 8.0,
@@ -223,9 +223,15 @@ def _safe_float(x, default: float = 0.0) -> float:
         return default
 
 
-def _merge_params(ticker: Optional[str]) -> dict:
+def _merge_params(ticker: Optional[str], params_override: Optional[dict] = None) -> dict:
     """
-    Merge global parameters with optional stock-specific parameters.
+    Merge global parameters with stock-specific parameters and optional override.
+
+    For AMZN/GOOG/INTC/MSFT:
+        use pre-fixed STOCK_PARAMS.
+
+    For AAPL:
+        params_override should be selected by the backtester using AAPL training data.
     """
     params = dict(BASE_PARAMS)
 
@@ -238,6 +244,9 @@ def _merge_params(ticker: Optional[str]) -> dict:
         if ticker in STOCK_PARAMS:
             params.update(STOCK_PARAMS[ticker])
 
+    if params_override is not None:
+        params.update(params_override)
+
     return params
 
 
@@ -247,27 +256,32 @@ class Strategy(BaseStrategy):
     """
     Adjusted Ye Strategy: Queue-Aware Toxicity Timing.
 
-    Main changes from the earlier offline version:
+    Main design:
     1. Tick-by-tick decision.
     2. Past-only rolling z-score.
     3. Past-only spread median.
     4. Past-only score quantile.
     5. First acceptable fallback tick.
     6. Minimum waiting time to avoid over-early execution.
-    7. Optional stock-specific parameters.
-    8. Hard adverse-selection filters based on microprice edge and quote instability.
+    7. Fixed stock-specific parameters for AMZN/GOOG/INTC/MSFT.
+    8. Optional autonomous params for AAPL, selected by training data only.
 
     on_tick(row, current_time) returns:
         True  -> execute now
         False -> do not execute
     """
 
-    def __init__(self, side: str, ticker: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        side: str,
+        ticker: Optional[str] = None,
+        params_override: Optional[dict] = None,
+    ) -> None:
         super().__init__(side)
 
         self.side = side.upper()
         self.ticker = ticker.upper() if ticker is not None else None
-        self.params = _merge_params(self.ticker)
+        self.params = _merge_params(self.ticker, params_override=params_override)
 
         rw = self.params["roll_win"]
         mid_sec = _parse_sec(self.params["mid"])
@@ -429,10 +443,8 @@ class Strategy(BaseStrategy):
             }
 
         # 5. Score using past-only z-scores
-        #    New: save z-scores into z_vals for hard filters.
         score = 0.0
         all_features_warm = True
-        z_vals = {}
 
         for key, val in feat_vals.items():
             z = self._feat_bufs[key].zscore(val)
@@ -441,7 +453,6 @@ class Strategy(BaseStrategy):
                 all_features_warm = False
                 z = 0.0
 
-            z_vals[key] = z
             score += self._weights[key] * z
 
         # 6. Read past-only thresholds
@@ -461,37 +472,7 @@ class Strategy(BaseStrategy):
         score_threshold = self._rb_score.quantile(trigger_q)
         spread_cap = self._rb_spread.median() * self.params["max_spread_mult"]
 
-        # 7. Hard adverse-selection filters
-        #
-        # BUY:
-        #   If micro_edge_z is too positive, microprice is above mid,
-        #   suggesting short-term upward pressure. Buying now may be adverse.
-        #
-        # SELL:
-        #   If micro_edge_z is too negative, microprice is below mid,
-        #   suggesting short-term downward pressure. Selling now may be adverse.
-        #
-        # Both sides:
-        #   If quote instability is too high, avoid early execution.
-
-        block_trade = False
-
-        if warm_enough:
-            micro_z = z_vals.get("micro_edge_z", 0.0)
-            quote_inst_z = z_vals.get("quote_instability_z", 0.0)
-
-            if self.side == "BUY":
-                if micro_z > 1.0:
-                    block_trade = True
-
-            elif self.side == "SELL":
-                if micro_z < -1.0:
-                    block_trade = True
-
-            if quote_inst_z > 1.5:
-                block_trade = True
-
-        # 8. Online execution decision
+        # 7. Online execution decision
         fire = False
 
         min_trade_sec = self.params["min_trade_sec"]
@@ -504,7 +485,6 @@ class Strategy(BaseStrategy):
         elif sec <= search_end:
             if (
                 warm_enough
-                and not block_trade
                 and not math.isnan(score_threshold)
                 and not math.isnan(spread_cap)
                 and spread <= spread_cap
@@ -515,18 +495,13 @@ class Strategy(BaseStrategy):
         elif sec >= fallback_start:
             # No hindsight selection.
             # Execute at first acceptable fallback tick.
-            #
-            # Note:
-            # In fallback window, we do not apply score threshold,
-            # because we must guarantee one trade per minute.
-            # However, we still avoid clearly unstable spreads when possible.
             if warm_enough and not math.isnan(spread_cap):
                 if spread <= spread_cap:
                     fire = True
             else:
                 fire = True
 
-        # 9. Update buffers after decision
+        # 8. Update buffers after decision
         self._ts_buy_exec.push(current_time, buy_exec_flow)
         self._ts_sell_exec.push(current_time, sell_exec_flow)
         self._ts_ask_cancel.push(current_time, ask_cancel)
