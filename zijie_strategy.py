@@ -43,6 +43,8 @@ class Strategy(BaseStrategy):
             self.rolling_tfi -= old_tf
         self.history.append(current_tf)
 
+        sec = current_time.second + current_time.microsecond / 1e6
+
         return should_execute(
             current=row,
             rolling_tfi=self.rolling_tfi,
@@ -50,11 +52,13 @@ class Strategy(BaseStrategy):
             macro_trend=macd_trend,
             tick_size=self.tick_size,
             avg_spread=self.avg_spread,
+            current_spread=current_spread,
+            sec=sec,
         )
 
 
 def should_execute(
-    current, rolling_tfi, side, macro_trend, tick_size, avg_spread
+    current, rolling_tfi, side, macro_trend, tick_size, avg_spread, current_spread, sec
 ) -> bool:
     is_large_tick = avg_spread <= 1.5 * tick_size
 
@@ -72,6 +76,14 @@ def should_execute(
             return obi < (-0.6 - trend_adj)
     else:  # small tick
         # Trade Flow Imbalance
+        is_tight_spread = current_spread <= avg_spread * 1.2
+
+        if sec >= 55:
+            return is_tight_spread
+
+        if not is_tight_spread:
+            return False
+
         current_volume = current["BidSize_1"] + current["AskSize_1"]
         tfi_norm = rolling_tfi / current_volume if current_volume > 0 else 0.0
 
