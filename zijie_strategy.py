@@ -75,6 +75,10 @@ def should_execute(
 
     trend_adj = np.clip(macro_trend * 10, -0.2, 0.2)
 
+    safe_spread = max(2.0 * tick_size, median_spread)
+    if current_spread > safe_spread + 1e-5:
+        return False
+
     if is_large_tick:
         # Order Book Imbalance
         obi = (current["BidSize_1"] - current["AskSize_1"]) / (
@@ -96,10 +100,6 @@ def should_execute(
             urgency = (60.0 - sec) / 20.0
 
         trigger_tfi = 1.5 * urgency
-
-        safe_spread = max(2.0 * tick_size, median_spread)
-        if current_spread > safe_spread + 1e-5:
-            return False
 
         if side == "BUY":
             return tfi_norm < (-trigger_tfi + trend_adj * 5)
