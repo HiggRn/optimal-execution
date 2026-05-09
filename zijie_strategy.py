@@ -64,33 +64,42 @@ def should_execute(
 
     trend_adj = np.clip(macro_trend * 10, -0.2, 0.2)
 
+    urgency = 1.0
+    if sec > 40.0:
+        urgency = (60.0 - sec) / 20.0
+
+    is_tight_spread = current_spread <= avg_spread * 1.2
+
+    if sec >= 58.0 and current_spread <= avg_spread * 1.5:
+        return True
+
     if is_large_tick:
         # Order Book Imbalance
         obi = (current["BidSize_1"] - current["AskSize_1"]) / (
             current["BidSize_1"] + current["AskSize_1"] + 1e-9
         )
+        trigger_obi = 0.6 * urgency
 
         if side == "BUY":
-            return obi > (0.6 - trend_adj)
+            signal_fire = obi > (trigger_obi - trend_adj)
         else:  # SELL
-            return obi < (-0.6 - trend_adj)
+            signal_fire = obi < (-trigger_obi - trend_adj)
+
+        return signal_fire and is_tight_spread
+
     else:  # small tick
         # Trade Flow Imbalance
-        is_tight_spread = current_spread <= avg_spread * 1.2
-
-        if sec >= 55:
-            return is_tight_spread
-
-        if not is_tight_spread:
-            return False
-
         current_volume = current["BidSize_1"] + current["AskSize_1"]
         tfi_norm = rolling_tfi / current_volume if current_volume > 0 else 0.0
 
+        trigger_tfi = 2.0 * urgency
+
         if side == "BUY":
-            return tfi_norm < (-2.0 + trend_adj * 5)
+            signal_fire = tfi_norm < (-trigger_tfi + trend_adj * 5)
         else:  # SELL
-            return tfi_norm > (2.0 + trend_adj * 5)
+            signal_fire = tfi_norm > (trigger_tfi + trend_adj * 5)
+
+        return signal_fire and is_tight_spread
 
 
 def compute_trade_flow(row):
