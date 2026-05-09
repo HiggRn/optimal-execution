@@ -1,6 +1,5 @@
 from collections import deque
 import math
-
 import numpy as np
 from base_strategy import BaseStrategy
 
@@ -13,22 +12,25 @@ class Strategy(BaseStrategy):
         self.rolling_tfi = 0.0
         self.tick_size = 0.01
 
-        self.avg_spread = None
         self.prev_time = None
         self.tau = tau
 
         self.ema_fast = None
         self.ema_slow = None
 
+        self.spread_history = deque(maxlen=100)
+        self.median_spread = None
+        self.tick_count = 0
+
     def on_tick(self, row, current_time) -> bool:
         current_spread = row["AskPrice_1"] - row["BidPrice_1"]
 
-        if self.avg_spread is None or self.prev_time is None:
-            self.avg_spread = current_spread
-        else:
-            dt = (current_time - self.prev_time).total_seconds()
-            decay = math.exp(-dt / self.tau)
-            self.avg_spread = current_spread * (1 - decay) + self.avg_spread * decay
+        self.spread_history.append(current_spread)
+        self.tick_count += 1
+
+        if self.median_spread is None or self.tick_count % 10 == 0:
+            sorted_spreads = sorted(self.spread_history)
+            self.median_spread = sorted_spreads[len(sorted_spreads) // 2]
 
         self.ema_fast, self.ema_slow, macd_trend = update_macd_trend(
             row, current_time, self.prev_time, self.ema_fast, self.ema_slow
@@ -38,9 +40,11 @@ class Strategy(BaseStrategy):
 
         current_tf = compute_trade_flow(row)
         self.rolling_tfi += current_tf
+
         if len(self.history) == self.window:
             old_tf = self.history[0]
             self.rolling_tfi -= old_tf
+
         self.history.append(current_tf)
 
         sec = current_time.second + current_time.microsecond / 1e6
@@ -51,16 +55,23 @@ class Strategy(BaseStrategy):
             side=self.side,
             macro_trend=macd_trend,
             tick_size=self.tick_size,
-            avg_spread=self.avg_spread,
+            median_spread=self.median_spread,
             current_spread=current_spread,
             sec=sec,
         )
 
 
 def should_execute(
-    current, rolling_tfi, side, macro_trend, tick_size, avg_spread, current_spread, sec
+    current,
+    rolling_tfi,
+    side,
+    macro_trend,
+    tick_size,
+    median_spread,
+    current_spread,
+    sec,
 ) -> bool:
-    is_large_tick = avg_spread <= 1.5 * tick_size
+    is_large_tick = median_spread <= 1.5 * tick_size
 
     trend_adj = np.clip(macro_trend * 10, -0.2, 0.2)
 
@@ -86,10 +97,10 @@ def should_execute(
 
         trigger_tfi = 2.0 * urgency
 
-        if sec >= 58.0 and current_spread <= avg_spread * 1.5:
+        if sec >= 58.0 and current_spread <= (median_spread + tick_size + 1e-5):
             return True
 
-        if current_spread > avg_spread * 1.2:
+        if current_spread > median_spread * 1.2:
             return False
 
         if side == "BUY":
