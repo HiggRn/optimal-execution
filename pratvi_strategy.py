@@ -22,7 +22,7 @@ class Strategy(BaseStrategy):
         self.median_spread = None
         self.tick_count = 0
 
-    def on_tick(self, row) -> bool:
+    def on_tick(self, row, idx) -> bool:
         current_spread = row["AskPrice_1"] - row["BidPrice_1"]
 
         self.spread_history.append(current_spread)
