@@ -7,12 +7,18 @@ from tqdm import tqdm
 from zijie_strategy import Strategy
 
 
-def run_backtest(df, strategy_class, *args, **kwargs):
+def run_backtest(df, strategy_class, show_progess=True, *args, **kwargs):
     results = []
 
     for side in ["BUY", "SELL"]:
         strat = strategy_class(side, *args, **kwargs)
-        for minute, grp in tqdm(df.groupby("Minute")):
+
+        if show_progess:
+            it = tqdm(df.groupby("Minute"))
+        else:
+            it = df.groupby("Minute")
+
+        for minute, grp in it:
             twap_price = (
                 grp["AskPrice_1"].iloc[0]
                 if side == "BUY"

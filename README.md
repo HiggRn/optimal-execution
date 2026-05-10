@@ -9,6 +9,18 @@ $ uv run backtest.py
 
 Note that the `data` folder is not included.
 
+## Grid Search
+
+To grid search parameters using one file only, run
+```bash
+$ uv run grid_search.py split --data ./data/{AMZN/GOOG/INTC/MSFT}_5levels_train.csv --ratio 0.5
+```
+
+To grid search parameters using two files, run
+```bash
+$ uv run grid_search.py dual --train ./data/{AMZN/GOOG/INTC/MSFT}_5levels_train.csv --test ./data/{AMZN/GOOG/INTC/MSFT}_5levels_test.csv
+```
+
 ## Strategy Idea
 
 1. Large / small tick detection: Stocks are classified into large-tick and small-tick categories to apply specialized logic. The current implementation uses a rolling median of the bid-ask spread for classification.
