@@ -1,6 +1,7 @@
 import os
 import argparse
 import itertools
+import numpy as np
 import pandas as pd
 import json
 
@@ -40,26 +41,47 @@ def pct_improvement(result_df):
     return pct_improv
 
 
-def grid_search(df_train, ticker):
-    print(f"\n[Grid Search] Start searching on {ticker} (Rows: {len(df_train)})")
+def grid_search(df_train, ticker, n_splits=4, train_frac=0.4):
+    print(f"\n[Grid Search] Start Blocked CV on {ticker} (Rows: {len(df_train)})")
 
     keys, values = zip(*PARAM_GRID.items())
     combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    minutes = np.array(sorted(df_train["Minute"].drop_duplicates()))
+    n = len(minutes)
+
+    min_train = max(1, int(n * train_frac))
+    test_size = max(1, (n - min_train) // n_splits)
+
+    splits = []
+    train_end = min_train
+    while train_end + test_size <= n:
+        va_mins = set(minutes[train_end : train_end + test_size])
+        va_df = df_train[df_train["Minute"].isin(va_mins)].copy()
+        splits.append(va_df)
+        train_end += test_size
 
     best_score = -float("inf")
     best_params = None
 
     for params in combinations:
-        res_df = run_backtest(df_train, Strategy, show_progess=False, **params)
-        score = pct_improvement(res_df)
+        cv_scores = []
+        for fold_idx, va_df in enumerate(splits):
+            res_df = run_backtest(va_df, Strategy, show_progess=False, **params)
+            score = pct_improvement(res_df)
+            cv_scores.append(score)
 
-        if score > best_score:
-            best_score = score
+        mean_cv_score = np.mean(cv_scores) if cv_scores else -float("inf")
+
+        if mean_cv_score > best_score:
+            best_score = mean_cv_score
             best_params = params
-            print(f"  -> Params: {params} | Improvement: {score:.4f}%")
+            print(
+                f"  -> [New Best] Params: {params} | CV Mean Improvement: {mean_cv_score:.4f}%"
+            )
 
     print(
-        f"[Grid Search] Best Params for {ticker}: {best_params} | Score: {best_score:.4f}%"
+        f"[Grid Search] Final Best Params for {ticker}: {best_params} | CV Score: {best_score:.4f}%"
     )
     return best_params
 

@@ -2,7 +2,7 @@
 
 This is the repository for the final project of ORIE 5259 Market Microstructure and Algorithmic Trading.
 
-The repo is managed by `uv`. To run the backtest, run
+The repo is managed by `uv`. To run the backtest with default parameters, run
 ```bash
 $ uv run backtest.py
 ```
