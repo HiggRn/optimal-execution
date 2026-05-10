@@ -4,7 +4,7 @@ import pandas as pd
 from scipy import stats
 from tqdm import tqdm
 
-from zijie_strategy import Strategy
+from strategy import Strategy
 
 
 def run_backtest(df, strategy_class, show_progess=True, *args, **kwargs):

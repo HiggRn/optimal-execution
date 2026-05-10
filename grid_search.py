@@ -6,7 +6,7 @@ import pandas as pd
 import json
 
 from backtest import run_backtest
-from zijie_strategy import Strategy
+from strategy import Strategy
 
 PARAM_GRID = {
     "obi_threshold": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
