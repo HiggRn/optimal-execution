@@ -2,11 +2,9 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import scipy.stats as stats
 from collections import deque
 from tqdm import tqdm
-
-from zijie_strategy import compute_trade_flow, update_macd_trend
-
 
 TICKERS = ["AMZN", "GOOG", "INTC", "MSFT"]
 TICK_SIZE = 0.01
@@ -14,300 +12,194 @@ TICK_SIZE = 0.01
 
 def enrich_features(df):
     df = df.copy()
-
-    ema_fast = None
-    ema_slow = None
-    prev_time = None
-
     spread_history = deque(maxlen=100)
     rolling_tfi = 0.0
     history = deque(maxlen=100)
 
     median_spread = None
     tick_count = 0
-
     records = []
 
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Enriching Features"):
         current_time = idx
         current_spread = row["AskPrice_1"] - row["BidPrice_1"]
 
-        # === median spread ===
         spread_history.append(current_spread)
         tick_count += 1
         if median_spread is None or tick_count % 10 == 0:
             sorted_spreads = sorted(spread_history)
             median_spread = sorted_spreads[len(sorted_spreads) // 2]
 
-        # === MACD ===
-        ema_fast, ema_slow, macd_trend = update_macd_trend(
-            row, current_time, prev_time, ema_fast, ema_slow
-        )
-        prev_time = current_time
+        total_size = row["BidSize_1"] + row["AskSize_1"]
+        if total_size == 0:
+            obi = np.nan
+            tfi_norm = np.nan
+        else:
+            obi = (row["BidSize_1"] - row["AskSize_1"]) / total_size
 
-        # === TFI ===
-        current_tf = compute_trade_flow(row)
-        rolling_tfi += current_tf
-        if len(history) == history.maxlen:
-            rolling_tfi -= history[0]
-        history.append(current_tf)
+            vis = row.get("VisibleExecution_1=Yes_0=No", 0)
+            hid = row.get("HiddenExecution_1=Yes_0=No", 0)
+            tfi = 0.0
+            if vis == 1 or hid == 1:
+                direction = row.get("Direction_1=Buy_-1=Sell", 0)
+                size = row.get("Size", 0)
+                tfi = (direction * size) / total_size
 
-        # === derived ===
-        current_volume = row["BidSize_1"] + row["AskSize_1"]
-        tfi_norm = rolling_tfi / current_volume if current_volume > 0 else 0.0
-
-        obi = (row["BidSize_1"] - row["AskSize_1"]) / (
-            row["BidSize_1"] + row["AskSize_1"] + 1e-9
-        )
+            rolling_tfi += tfi
+            if len(history) == history.maxlen:
+                rolling_tfi -= history[0]
+            history.append(tfi)
+            tfi_norm = rolling_tfi
 
         is_large_tick = median_spread <= 1.5 * TICK_SIZE
-
-        sec = current_time.second + current_time.microsecond / 1e6
-
-        safe_spread = max(2.0 * TICK_SIZE, median_spread)
 
         records.append(
             {
                 "time": current_time,
+                "mid_price": (row["AskPrice_1"] + row["BidPrice_1"]) / 2.0,
                 "spread": current_spread,
                 "median_spread": median_spread,
                 "is_large_tick": is_large_tick,
                 "obi": obi,
                 "tfi_norm": tfi_norm,
-                "macd": macd_trend,
-                "sec": sec,
-                "safe_spread": safe_spread,
-                "bid": row["BidPrice_1"],
-                "ask": row["AskPrice_1"],
             }
         )
 
     feat_df = pd.DataFrame(records).set_index("time")
-    return feat_df
+    return feat_df.dropna(subset=["obi", "tfi_norm"])
 
 
-def detect_next_mid_change_events(df):
-    mid = (df["BidPrice_1"] + df["AskPrice_1"]) / 2.0
+def compute_forward_returns(feat_df, horizon_seconds=1.0):
+    unique_mid = feat_df["mid_price"].groupby(level=0).last()
 
-    mid_reset = mid.reset_index(drop=True)
+    forward_time = feat_df.index + pd.Timedelta(seconds=horizon_seconds)
+    target_idx = unique_mid.index.get_indexer(forward_time, method="nearest")
+    future_mid = pd.Series(unique_mid.iloc[target_idx].values, index=feat_df.index)
 
-    changed_mid = mid_reset.loc[mid_reset.diff() != 0]
-
-    next_actual_mid = changed_mid.shift(-1).reindex(mid_reset.index).bfill()
-
-    price_move = next_actual_mid.values - mid.values
-    return pd.Series(np.sign(price_move), index=df.index)
+    fwd_ret_bps = (future_mid - feat_df["mid_price"]) / feat_df["mid_price"] * 10000
+    return fwd_ret_bps
 
 
-# 1. Large/Small Tick
-def analyze_tick_regime(feat_df, ticker):
-    regime = feat_df["is_large_tick"]
-    time_diff = feat_df.index.to_series().diff().shift(-1).dt.total_seconds().fillna(0)
+def analyze_signal_rigorous(df_sub, signal_col, ticker, regime_name, horizon=1.0):
+    df_sub = df_sub.copy()
+    df_sub["fwd_ret"] = compute_forward_returns(df_sub, horizon_seconds=horizon)
+    df_sub = df_sub.dropna(subset=[signal_col, "fwd_ret"])
 
-    large_duration = time_diff[regime].sum()
-    total_duration = time_diff.sum()
-    large_ratio = large_duration / total_duration if total_duration > 0 else 0
-
-    print(f"[{ticker}] Large tick regime time ratio: {large_ratio:.2%}")
-    if large_ratio < 0.05 or large_ratio > 0.95:
-        print(f"  -> Warning: {ticker} 几乎单一 Regime，可能不适合双轨策略。")
-
-    plt.figure(figsize=(10, 5))
-    plt.hist(
-        feat_df["median_spread"],
-        bins=np.arange(0, 0.05, 0.001),
-        alpha=0.7,
-        color="steelblue",
-        edgecolor="black",
-    )
-    plt.axvline(
-        1.5 * TICK_SIZE, color="red", linestyle="--", label=f"Threshold (1.5 tick)"
-    )
-    plt.title(f"{ticker} Median Spread Distribution & Regime Threshold")
-    plt.xlabel("Median Spread")
-    plt.ylabel("Tick Count")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"plots/{ticker}_regime_spread.png")
-    plt.close()
-
-
-# 2. MACD
-def analyze_macd_trend(feat_df, df, ticker):
-    mid = (df["BidPrice_1"] + df["AskPrice_1"]) / 2.0
-
-    unique_mid = mid.groupby(level=0).last()
-
-    forward_times = feat_df.index + pd.Timedelta(seconds=30)
-
-    target_idx = unique_mid.index.get_indexer(forward_times, method="nearest")
-    target_mids = pd.Series(unique_mid.iloc[target_idx].values, index=feat_df.index)
-
-    forward_return = (target_mids - mid) / mid * 10000  # 转换为 bps
-
-    valid_mask = forward_return.notna() & feat_df["macd"].notna()
-    macd_vals = feat_df.loc[valid_mask, "macd"]
-    fwd_ret_vals = forward_return[valid_mask]
-
-    bins = pd.qcut(macd_vals, q=10, duplicates="drop")
-    grouped_ret = fwd_ret_vals.groupby(bins).mean()
-
-    plt.figure(figsize=(10, 5))
-    grouped_ret.plot(kind="bar", color="darkorange")
-    plt.title(f"{ticker} MACD Deciles vs 30s Forward Mid-Price Return (bps)")
-    plt.xlabel("MACD Deciles")
-    plt.ylabel("Mean 30s Forward Return (bps)")
-    plt.grid(axis="y", alpha=0.3)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig(f"plots/{ticker}_macd_trend.png")
-    plt.close()
-
-
-# 3. Large Tick: OBI (Accuracy vs Count Tradeoff)
-def analyze_obi(feat_df, price_move_sign, ticker):
-    mask = feat_df["is_large_tick"]
-    if mask.sum() < 100:
+    if len(df_sub) < 100:
         return
 
-    df_sub = feat_df[mask].copy()
-    y_true = price_move_sign[mask].values
-
-    thresholds = np.linspace(0.1, 0.9, 30)
-    acc_list = []
-    count_list = []
-
-    for th in thresholds:
-        signal = df_sub["obi"] > th
-        total_signals = signal.sum()
-
-        if total_signals > 50:
-            correct = (y_true == 1)[signal].sum()
-            acc_list.append(correct / total_signals)
-        else:
-            acc_list.append(np.nan)
-        count_list.append(total_signals)
-
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.plot(
-        thresholds, acc_list, "b-", marker="o", label="Accuracy (L1 Clear Direction)"
+    # 1. Information Coefficient (IC)
+    ic, p_val = stats.spearmanr(df_sub[signal_col], df_sub["fwd_ret"])
+    print(
+        f"[{ticker} - {regime_name}] {signal_col.upper()} {horizon}s Forward IC: {ic:.4f} (p-value: {p_val:.4e})"
     )
-    ax1.set_xlabel("OBI Threshold (Buy Signal > th)")
-    ax1.set_ylabel("Predictive Accuracy", color="b")
-    ax1.tick_params("y", colors="b")
-    ax1.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
 
-    ax2 = ax1.twinx()
-    ax2.plot(thresholds, count_list, "r--", marker="x", label="Trade Count")
-    ax2.set_ylabel("Number of Signals", color="r")
-    ax2.tick_params("y", colors="r")
+    # 2. Decile Analysis
+    try:
+        df_sub["decile"] = pd.qcut(
+            df_sub[signal_col], q=10, labels=False, duplicates="drop"
+        )
+        decile_returns = df_sub.groupby("decile")["fwd_ret"].mean()
 
-    plt.title(f"{ticker} Large Tick: OBI Predictive Power Tradeoff")
-    fig.tight_layout()
-    plt.savefig(f"plots/{ticker}_obi_tradeoff.png")
-    plt.close()
+        plt.figure(figsize=(8, 5))
+        decile_returns.plot(kind="bar", color="steelblue", edgecolor="black")
+        plt.title(
+            f"{ticker} {regime_name}: {signal_col.upper()} Deciles vs {horizon}s Forward Return"
+        )
+        plt.xlabel(f"{signal_col.upper()} Deciles (Low -> High)")
+        plt.ylabel(f"Mean {horizon}s Forward Return (bps)")
+        plt.axhline(0, color="red", linewidth=1, linestyle="--")
+        plt.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"plots/{ticker}_{regime_name}_{signal_col}_deciles.png")
+        plt.close()
+    except ValueError:
+        print(
+            f"  -> Skipping decile plot for {ticker} due to insufficient unique values."
+        )
+
+    # 3. T-Test for Extreme Thresholds
+    threshold = df_sub[signal_col].quantile(0.90)
+    neg_threshold = df_sub[signal_col].quantile(0.10)
+
+    buy_signals = df_sub[df_sub[signal_col] > threshold]["fwd_ret"]
+    sell_signals = df_sub[df_sub[signal_col] < neg_threshold]["fwd_ret"]
+
+    if len(buy_signals) > 0 and len(sell_signals) > 0:
+        t_stat, t_pval = stats.ttest_ind(buy_signals, sell_signals, equal_var=False)
+        print(
+            f"  -> Top 10% vs Bottom 10% T-Test: T-stat = {t_stat:.4f}, p-val = {t_pval:.4e}"
+        )
+        print(f"  -> Top 10% Mean Ret: {buy_signals.mean():.4f} bps")
+        print(f"  -> Bottom 10% Mean Ret: {sell_signals.mean():.4f} bps")
 
 
-# 4. Small Tick: TFI (Accuracy vs Count Tradeoff)
-def analyze_tfi(feat_df, price_move_sign, ticker):
-    mask = ~feat_df["is_large_tick"]
-    if mask.sum() < 100:
+def analyze_event_study(feat_df, signal_col, ticker, regime_name, is_buy_signal=True):
+    if is_buy_signal:
+        threshold = feat_df[signal_col].quantile(0.95)
+        triggers = feat_df[feat_df[signal_col] > threshold].index
+    else:
+        threshold = feat_df[signal_col].quantile(0.05)
+        triggers = feat_df[feat_df[signal_col] < threshold].index
+
+    if len(triggers) == 0:
         return
 
-    df_sub = feat_df[mask].copy()
-    y_true = price_move_sign[mask].values
+    if len(triggers) > 1000:
+        triggers = np.random.choice(triggers, 1000, replace=False)
 
-    thresholds = np.linspace(0.5, 5.0, 30)
-    acc_list = []
-    count_list = []
+    unique_mid = feat_df["mid_price"].groupby(level=0).last()
 
-    for th in thresholds:
-        signal = df_sub["tfi_norm"] < -th
-        total_signals = signal.sum()
+    offsets = np.arange(-1.0, 2.1, 0.1)
+    paths = []
 
-        if total_signals > 50:
-            correct = (y_true == -1)[signal].sum()
-            acc_list.append(correct / total_signals)
-        else:
-            acc_list.append(np.nan)
-        count_list.append(total_signals)
+    for t in triggers:
+        sample_times = t + pd.to_timedelta(offsets, unit="s")
+        idx = unique_mid.index.get_indexer(sample_times, method="nearest")
+        prices = unique_mid.iloc[idx].values
 
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.plot(thresholds, acc_list, "g-", marker="o", label="Accuracy (Mid Move Down)")
-    ax1.set_xlabel("TFI Threshold (Signal < -th)")
-    ax1.set_ylabel("Predictive Accuracy", color="g")
-    ax1.tick_params("y", colors="g")
-    ax1.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
+        t0_idx = np.where(np.isclose(offsets, 0.0))[0][0]
+        base_price = prices[t0_idx]
 
-    ax2 = ax1.twinx()
-    ax2.plot(thresholds, count_list, "r--", marker="x", label="Trade Count")
-    ax2.set_ylabel("Number of Signals", color="r")
-    ax2.tick_params("y", colors="r")
+        if base_price > 0:
+            path_bps = (prices - base_price) / base_price * 10000
+            paths.append(path_bps)
 
-    plt.title(f"{ticker} Small Tick: TFI (Normalized) Predictive Power Tradeoff")
-    fig.tight_layout()
-    plt.savefig(f"plots/{ticker}_tfi_tradeoff.png")
-    plt.close()
+    if paths:
+        mean_path = np.nanmean(paths, axis=0)
+        std_err = np.nanstd(paths, axis=0) / np.sqrt(len(paths))
 
+        plt.figure(figsize=(8, 5))
+        plt.plot(
+            offsets,
+            mean_path,
+            label="Mean Mid Price Path (bps)",
+            color="darkred",
+            linewidth=2,
+        )
+        plt.fill_between(
+            offsets,
+            mean_path - 1.96 * std_err,
+            mean_path + 1.96 * std_err,
+            color="red",
+            alpha=0.2,
+        )
+        plt.axvline(0, color="black", linestyle="--", label="Signal Trigger (T=0)")
+        plt.axhline(0, color="gray", linewidth=1)
 
-# 5. Spread Filter
-def analyze_spread_filter(feat_df, df, ticker):
-    mask = ~feat_df["is_large_tick"]
-    if mask.sum() < 100:
-        return
-
-    df_sub = feat_df[mask].copy()
-    bad_cond = df_sub["spread"] > df_sub["safe_spread"] + 1e-5
-
-    mid = (df["BidPrice_1"] + df["AskPrice_1"]) / 2.0
-    unique_mid = mid.groupby(level=0).last()
-
-    future_time = df_sub.index + pd.Timedelta(seconds=1)
-    target_idx = unique_mid.index.get_indexer(future_time, method="nearest")
-    future_mid = pd.Series(unique_mid.iloc[target_idx].values, index=df_sub.index)
-
-    current_mid = (df_sub["bid"] + df_sub["ask"]) / 2.0
-    abs_price_move = (future_mid - current_mid).abs()
-
-    mean_risk_good = abs_price_move[~bad_cond].mean()
-    mean_risk_bad = abs_price_move[bad_cond].mean()
-
-    print(f"[{ticker}] Spread Filter Risk Analysis (Mean Abs Price Move in 1s):")
-    print(f"  -> Spread Normal (Trade Allowed): {mean_risk_good:.5f}")
-    print(f"  -> Spread Expanded (Trade Blocked): {mean_risk_bad:.5f}")
-
-    plt.figure(figsize=(10, 5))
-    plot_good = abs_price_move[~bad_cond].clip(upper=0.1)
-    plot_bad = abs_price_move[bad_cond].clip(upper=0.1)
-
-    plt.hist(
-        plot_good,
-        bins=50,
-        density=True,
-        histtype="step",
-        cumulative=True,
-        label="Normal Spread",
-        color="blue",
-    )
-    plt.hist(
-        plot_bad,
-        bins=50,
-        density=True,
-        histtype="step",
-        cumulative=True,
-        label="Expanded Spread (Blocked)",
-        color="red",
-    )
-
-    plt.title(f"{ticker} CDF of 1s Absolute Price Move (Risk Profile)")
-    plt.xlabel("Absolute Price Move in 1 second")
-    plt.ylabel("Cumulative Probability")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"plots/{ticker}_spread_filter_cdf.png")
-    plt.close()
+        direction = "Buy" if is_buy_signal else "Sell"
+        plt.title(
+            f"{ticker} {regime_name}: Event Study around Extreme {direction} {signal_col.upper()}"
+        )
+        plt.xlabel("Time relative to trigger (seconds)")
+        plt.ylabel("Mid Price Change (bps)")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(
+            f"plots/{ticker}_{regime_name}_{signal_col}_{direction}_event_study.png"
+        )
+        plt.close()
 
 
 def run_research():
@@ -319,7 +211,7 @@ def run_research():
             print(f"Data not found for {ticker}, skipping.")
             continue
 
-        print(f"\n================ Processing {ticker} ================")
+        print(f"\n{'=' * 20} Processing {ticker} {'=' * 20}")
         df = pd.read_csv(path)
         df.columns = [c.strip() for c in df.columns]
 
@@ -327,26 +219,28 @@ def run_research():
         df = df.sort_values("Time_dt")
         df.set_index("Time_dt", inplace=True)
 
-        print("1. Enriching Features (Running MACD, OBI, TFI state machines)...")
+        print("1. Enriching Features...")
         feat_df = enrich_features(df)
 
-        print("2. Detecting Forward Labels...")
-        price_move_sign = detect_next_mid_change_events(df)
+        print("2. Analyzing Large Tick Regime (OBI)...")
+        large_tick_df = feat_df[feat_df["is_large_tick"]]
+        if not large_tick_df.empty:
+            analyze_signal_rigorous(
+                large_tick_df, "obi", ticker, "LargeTick", horizon=1.0
+            )
+            analyze_event_study(
+                large_tick_df, "obi", ticker, "LargeTick", is_buy_signal=True
+            )
 
-        print("3. Analyzing Regime Validity...")
-        analyze_tick_regime(feat_df, ticker)
-
-        print("4. Analyzing MACD Macro Trend...")
-        analyze_macd_trend(feat_df, df, ticker)
-
-        print("5. Analyzing OBI Tradeoffs (Large Tick)...")
-        analyze_obi(feat_df, price_move_sign, ticker)
-
-        print("6. Analyzing TFI Tradeoffs (Small Tick)...")
-        analyze_tfi(feat_df, price_move_sign, ticker)
-
-        print("7. Analyzing Spread Filter Execution Logic...")
-        analyze_spread_filter(feat_df, df, ticker)
+        print("3. Analyzing Small Tick Regime (TFI)...")
+        small_tick_df = feat_df[~feat_df["is_large_tick"]]
+        if not small_tick_df.empty:
+            analyze_signal_rigorous(
+                small_tick_df, "tfi_norm", ticker, "SmallTick", horizon=1.0
+            )
+            analyze_event_study(
+                small_tick_df, "tfi_norm", ticker, "SmallTick", is_buy_signal=True
+            )
 
 
 if __name__ == "__main__":
