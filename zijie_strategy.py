@@ -4,13 +4,16 @@ from base_strategy import BaseStrategy
 
 
 class Strategy(BaseStrategy):
-    def __init__(self, side, window=100):
+    def __init__(self, side, window=100, obi_threshold=0.8, tfi_multiplier=1.0):
         super().__init__(side)
         self.window = window
+        self.obi_threshold = obi_threshold
+        self.tfi_multiplier = tfi_multiplier
+
         self.tfi_history = deque(maxlen=window)
         self.tick_size = 0.01
 
-        self.spread_history = deque(maxlen=100)
+        self.spread_history = deque(maxlen=window)
         self.median_spread = None
         self.tick_count = 0
 
@@ -58,6 +61,8 @@ class Strategy(BaseStrategy):
             tfi=tfi,
             rolling_tfi_mean=rolling_tfi_mean,
             rolling_tfi_std=rolling_tfi_std,
+            obi_threshold=self.obi_threshold,
+            tfi_multiplier=self.tfi_multiplier,
         )
 
         self.tfi_history.append(tfi)
@@ -74,6 +79,8 @@ def should_execute(
     tfi,
     rolling_tfi_mean,
     rolling_tfi_std,
+    obi_threshold,
+    tfi_multiplier,
 ) -> bool:
     is_large_tick = median_spread <= 1.5 * tick_size
 
@@ -84,13 +91,13 @@ def should_execute(
     if is_large_tick:
         # Order Book Imbalance
         if side == "BUY":
-            return obi > 0.8
+            return obi > obi_threshold
         else:  # SELL
-            return obi < -0.8
+            return obi < -obi_threshold
 
     else:  # small tick
         # Trade Flow Imbalance
         if side == "BUY":
-            return tfi < (rolling_tfi_mean - rolling_tfi_std)
+            return tfi < (rolling_tfi_mean - tfi_multiplier * rolling_tfi_std)
         else:  # SELL
-            return tfi > (rolling_tfi_mean + rolling_tfi_std)
+            return tfi > (rolling_tfi_mean + tfi_multiplier * rolling_tfi_std)
